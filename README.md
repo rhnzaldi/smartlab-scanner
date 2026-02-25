@@ -106,17 +106,6 @@ python test_webcam.py --no-face-verify
 python test_webcam.py
 ```
 
-## 📡 API Endpoints
-
-| Method | Endpoint | Deskripsi |
-|--------|----------|-----------|
-| `GET` | `/health` | Health check + status model |
-| `POST` | `/api/scan` | Upload gambar → scan KTM |
-| `POST` | `/api/checkout/{nim}` | Check-out mahasiswa |
-| `GET` | `/api/status` | List peminjaman aktif |
-| `WS` | `/ws/scan` | WebSocket real-time scanning |
-| `GET` | `/docs` | Swagger UI (auto-generated) |
-
 ### POST `/api/scan` — Contoh Response
 
 ```json
@@ -230,14 +219,6 @@ smartlab-scanner/
 |----------|---------|------------|
 | `CORS_ORIGINS` | `http://localhost:3000,...` | Allowed CORS origins (comma-separated) |
 | `DYLD_LIBRARY_PATH` | — | macOS: set ke `/opt/homebrew/lib` jika perlu |
-
-## 🛡 Security Notes
-
-- CORS di-restrict per environment (tidak wildcard di production)
-- Input NIM di-validate via regex
-- Upload dibatasi 10MB
-- Query SQL selalu parameterized (anti SQL injection)
-- Error response tidak leak detail internal
 
 ## 📝 Tech Stack
 
