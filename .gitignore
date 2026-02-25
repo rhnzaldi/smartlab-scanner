@@ -1,0 +1,44 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environment ──
+.venv/
+venv/
+env/
+
+# ── ML Model Weights (large binary) ──
+# Download or train your own model. See README.md
+models/*.pt
+models/*.onnx
+
+# ── Database (generated at runtime) ──
+smartlab.db
+smartlab.db-wal
+smartlab.db-shm
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── macOS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Captures (saved webcam frames) ──
+captures/
+
+# ── Logs ──
+*.log
+
+# ── Gemini/Agent artifacts ──
+.gemini/
