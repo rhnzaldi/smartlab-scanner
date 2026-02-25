@@ -1,103 +1,257 @@
-# 🎓 Smart-Lab SV IPB — ML Engine
+# 🎓 Smart-Lab SV IPB — KTM Scanner
 
-Sistem pemindaian **Kartu Tanda Mahasiswa (KTM)** secara real-time menggunakan Computer Vision.
+Sistem pemindaian **Kartu Tanda Mahasiswa (KTM)** secara real-time menggunakan Computer Vision + Face Verification untuk manajemen akses laboratorium.
+
+## ✨ Fitur
+
+- 🔍 **YOLO Detection** — Deteksi QR Code, NIM, Nama, dan Pas Foto pada KTM
+- 📝 **PaddleOCR** — Ekstraksi teks NIM dan Nama dari gambar
+- 📱 **QR Decode** — Baca NIM dari QR Code (pyzbar) dengan 4 strategi fallback
+- ✅ **Double Validation** — Cross-check NIM dari QR dan OCR
+- 👤 **Face Verification** — Bandingkan wajah live dengan foto KTM (OpenCV Haar Cascade)
+- 🗄️ **Database** — Verifikasi identitas dan pencatatan check-in/check-out lab
+- 🌐 **REST + WebSocket API** — FastAPI backend untuk integrasi frontend
 
 ## 🏗 Arsitektur
 
 ```
-Frame Webcam
-    │
-    ▼
-┌──────────┐    ┌──────────────┐    ┌──────────┐    ┌────────────┐
-│  YOLOv8  │───▶│  OpenCV Pre  │───▶│ PaddleOCR │───▶│  Validator │
-│  Detect  │    │  processing  │    │ + pyzbar  │    │  (Regex)   │
-└──────────┘    └──────────────┘    └──────────┘    └────────────┘
-   4 objek:        grayscale         NIM teks         clean NIM
-   qr_code         blur              Nama teks        clean Name
-   nim_teks        sharpen            QR data          NIM match
-   nama_teks       threshold
-   pas_foto
+Webcam Frame
+     │
+     ▼
+┌──────────┐    ┌──────────────┐    ┌───────────┐    ┌────────────┐
+│  YOLOv8  │───▶│  Preprocess  │───▶│ PaddleOCR │───▶│  Validator  │
+│  Detect  │    │  (OpenCV)    │    │ + pyzbar  │    │  (Regex)    │
+└──────────┘    └──────────────┘    └───────────┘    └─────┬──────┘
+   4 class:        grayscale          NIM text              │
+   qr_code         blur              Nama text        ┌────▼──────┐
+   text_nim         sharpen           QR data          │  SQLite   │
+   text_nama        threshold                          │ Verify +  │
+   face_photo                                          │ Check-in  │
+                                                       └────┬──────┘
+                                                            │
+                                                       ┌────▼──────┐
+                                                       │   Face    │
+                                                       │  Verify   │
+                                                       └───────────┘
+```
+
+### 🔄 Webcam Scanner — 5-Phase State Machine
+
+```
+┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────┐    ┌──────────┐
+│ SCANNING │───▶│  IDENTITAS   │───▶│  VERIFIKASI  │───▶│ COMPLETE │───▶│ COOLDOWN │
+│          │    │  DITEMUKAN   │    │    WAJAH     │    │          │    │          │
+│ Deteksi  │    │   (2 detik)  │    │  (5 detik)   │    │ (2 detik)│    │ (3 detik)│
+│ KTM      │    │  Info DB     │    │  Countdown   │    │ Berhasil │    │  Idle    │
+└──────────┘    └──────────────┘    └──────────────┘    └──────────┘    └──────────┘
+      ▲                                                                      │
+      └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 📋 Prerequisites
 
-- Python 3.9+
-- Webcam (built-in / USB)
-- File `best.pt` (trained YOLOv8 model) — lihat bagian Training
+- **Python** 3.9+
+- **Webcam** (built-in / USB)
+- **Model** `best.pt` — YOLOv8 yang sudah di-train (lihat [Training](#-training))
+- **OS**: macOS / Linux (belum ditest di Windows)
 
 ## 🚀 Quick Start
 
 ```bash
-# 1. Install dependencies
+# 1. Clone repo
+git clone https://github.com/rhnzaldi/smartlab-scanner.git
+cd smartlab-scanner
+
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 2. Copy model ke folder models/
+# 3. Copy trained model
 cp /path/to/your/best.pt models/best.pt
 
-# 3. Test dengan webcam (tanpa server)
+# 4. Seed database (opsional — edit daftar mahasiswa di file ini)
+python seed_mahasiswa.py
+
+# 5. Jalankan webcam scanner
 python test_webcam.py
 
-# 4. Jalankan FastAPI server
+# 6. Atau jalankan API server
 python main.py
-# atau: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## 🎮 Webcam Test Controls
+### macOS — Jika ada error library:
 
-| Key | Action |
+```bash
+DYLD_LIBRARY_PATH=/opt/homebrew/lib python test_webcam.py
+```
+
+## 🎮 Webcam Controls
+
+| Key | Fungsi |
 |-----|--------|
 | `q` | Quit |
 | `s` | Save frame ke `captures/` |
 | `SPACE` | Pause / Resume |
 | `+` / `-` | Adjust confidence threshold |
+| `o` | Force trigger OCR |
+| `c` | Manual check-out (input NIM) |
+| `r` | Reset semua peminjaman aktif |
 
-## 🤖 Training Model (Google Colab)
+### Opsi Command Line
 
-Lihat file `train_colab.py` untuk panduan lengkap training YOLOv8 di Google Colab menggunakan dataset Roboflow.
+```bash
+# Tanpa face verification (lebih cepat)
+python test_webcam.py --no-face-verify
+
+# Dengan face verification (default)
+python test_webcam.py
+```
 
 ## 📡 API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check |
-| POST | `/api/scan` | Upload image, get scan result |
-| WS | `/ws/scan` | WebSocket real-time scanning |
+| Method | Endpoint | Deskripsi |
+|--------|----------|-----------|
+| `GET` | `/health` | Health check + status model |
+| `POST` | `/api/scan` | Upload gambar → scan KTM |
+| `POST` | `/api/checkout/{nim}` | Check-out mahasiswa |
+| `GET` | `/api/status` | List peminjaman aktif |
+| `WS` | `/ws/scan` | WebSocket real-time scanning |
+| `GET` | `/docs` | Swagger UI (auto-generated) |
 
-### WebSocket Protocol
+### POST `/api/scan` — Contoh Response
 
-```javascript
-// Client sends base64 image:
-ws.send(JSON.stringify({ image: "data:image/jpeg;base64,..." }))
-
-// Server responds:
+```json
 {
   "success": true,
   "status": "validated",
-  "nim_qr": "J3B121015",
-  "nim_ocr": "J3B121015",
-  "nim_final": "J3B121015",
-  "nama": "Ahmad Zaldi",
+  "nim_final": "J0403231XXX",
+  "nama": "Nama Mahasiswa",
   "nim_match": true,
-  "validation_detail": "✅ NIM MATCH: 'J3B121015'",
+  "db_verified": true,
+  "db_prodi": "TPL",
+  "checkin": {
+    "success": true,
+    "message": "📥 Check-in berhasil!"
+  },
   "inference_time_ms": 45.2,
   "total_time_ms": 230.5
 }
 ```
 
+### WebSocket `/ws/scan`
+
+```javascript
+// Client kirim base64 image
+ws.send(JSON.stringify({ image: "data:image/jpeg;base64,..." }))
+
+// Server merespons dengan hasil scan + DB verify + check-in
+```
+
+## 🗄️ Database
+
+Menggunakan **SQLite** (file: `smartlab.db`, auto-created).
+
+### Tabel `mahasiswa`
+| Kolom | Tipe | Keterangan |
+|-------|------|------------|
+| `nim` | TEXT (PK) | NIM mahasiswa |
+| `nama` | TEXT | Nama lengkap |
+| `prodi` | TEXT | Program studi |
+| `angkatan` | INTEGER | Tahun masuk |
+| `status` | TEXT | `aktif` / `nonaktif` |
+
+### Tabel `peminjaman`
+| Kolom | Tipe | Keterangan |
+|-------|------|------------|
+| `id` | INTEGER (PK) | Auto increment |
+| `nim` | TEXT (FK) | Referensi ke mahasiswa |
+| `lab` | TEXT | Nama lab |
+| `waktu_masuk` | TIMESTAMP | Waktu check-in |
+| `waktu_keluar` | TIMESTAMP | Waktu check-out |
+| `status` | TEXT | `aktif` / `selesai` |
+
+### Menambah Data Mahasiswa
+
+Edit file `seed_mahasiswa.py`:
+
+```python
+MAHASISWA = [
+    ("J04032310XX", "Nama Mahasiswa", "Prodi", 2023),
+    # Tambahkan baris baru di sini
+]
+```
+
+Lalu jalankan:
+
+```bash
+python seed_mahasiswa.py
+```
+
+## 🤖 Training
+
+Model YOLOv8 di-train menggunakan Google Colab. Lihat `train_colab.py` untuk panduan lengkap.
+
+### Dataset
+- **Objek**: `qr_code`, `text_nim`, `text_nama`, `face_photo`
+- **Augmentasi**: `augment_dataset.py` — rotasi, blur, brightness, noise
+- **Platform**: Roboflow untuk labeling + export
+
+### Langkah Training
+1. Upload dataset ke Roboflow
+2. Buka Google Colab
+3. Jalankan `train_colab.py` (ikuti instruksi di file)
+4. Download `best.pt` ke `models/best.pt`
+
 ## 📁 Struktur Proyek
 
 ```
-ScanKtm/
-├── ml/                    # ML Pipeline modules
-│   ├── __init__.py
-│   ├── pipeline.py        # KTMPipeline orchestrator
-│   ├── preprocessor.py    # OpenCV preprocessing
-│   ├── extractor.py       # PaddleOCR + pyzbar
-│   └── validator.py       # Regex cleaning & validation
+smartlab-scanner/
+├── ml/                        # ML Pipeline
+│   ├── pipeline.py            # Orchestrator: detect → crop → extract → validate
+│   ├── preprocessor.py        # OpenCV preprocessing (grayscale, blur, sharpen)
+│   ├── extractor.py           # PaddleOCR + pyzbar extraction
+│   ├── validator.py           # Regex cleaning & NIM double-validation
+│   └── face_verify.py         # Haar Cascade face verification
+├── db/
+│   └── database.py            # SQLite: mahasiswa + peminjaman management
 ├── models/
-│   └── best.pt            # YOLOv8 model (anda copy ke sini)
-├── main.py                # FastAPI backend
-├── test_webcam.py         # Standalone webcam test
-├── train_colab.py         # Colab training guide
-└── requirements.txt
+│   └── best.pt                # YOLOv8 model weights (git-ignored)
+├── main.py                    # FastAPI REST + WebSocket server
+├── test_webcam.py             # Standalone webcam scanner (5-phase UX)
+├── seed_mahasiswa.py          # Script untuk seed data mahasiswa
+├── train_colab.py             # Panduan training di Google Colab
+├── augment_dataset.py         # Data augmentation script
+├── requirements.txt           # Python dependencies
+└── .gitignore
 ```
+
+## ⚙️ Environment Variables
+
+| Variable | Default | Keterangan |
+|----------|---------|------------|
+| `CORS_ORIGINS` | `http://localhost:3000,...` | Allowed CORS origins (comma-separated) |
+| `DYLD_LIBRARY_PATH` | — | macOS: set ke `/opt/homebrew/lib` jika perlu |
+
+## 🛡 Security Notes
+
+- CORS di-restrict per environment (tidak wildcard di production)
+- Input NIM di-validate via regex
+- Upload dibatasi 10MB
+- Query SQL selalu parameterized (anti SQL injection)
+- Error response tidak leak detail internal
+
+## 📝 Tech Stack
+
+| Komponen | Teknologi |
+|----------|-----------|
+| Object Detection | YOLOv8 (Ultralytics) |
+| OCR | PaddleOCR v5 |
+| QR Decode | pyzbar |
+| Face Detection | OpenCV Haar Cascade |
+| Face Matching | Histogram Comparison |
+| Backend | FastAPI + Uvicorn |
+| Database | SQLite (WAL mode) |
+| Image Processing | OpenCV + NumPy |
+
+## 📄 License
+
+MIT
