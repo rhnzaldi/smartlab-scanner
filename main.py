@@ -151,6 +151,10 @@ def _process_scan_result(result: ScanResult) -> dict:
     """
     Process scan result: verify DB + check-in jika verified.
     [M4] Single source of truth untuk scan→verify→checkin logic.
+    
+    TODO: API ini BELUM menjalankan face verification.
+    Check-in via API langsung tanpa pengecekan wajah.
+    Untuk production, tambahkan face verify sebelum check-in.
     """
     response = result.to_dict()
 

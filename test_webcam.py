@@ -89,7 +89,7 @@ class StabilityTracker:
     """
     State machine untuk alur scanning KTM.
     Phase transitions:
-      SCANNING → IDENTITY_FOUND → FACE_VERIFY → COMPLETE → COOLDOWN → SCANNING
+      SCANNING → IDENTITY_FOUND → FACE_ENROLL/FACE_VERIFY → COMPLETE → COOLDOWN → SCANNING
     """
     def __init__(self, face_verify_enabled=True):
         self.consecutive_count = 0
@@ -97,6 +97,7 @@ class StabilityTracker:
         self.phase_start = 0.0
         self.face_verify_enabled = face_verify_enabled
         self._needs_enrollment = False  # True jika belum ada encoding di DB
+        self._face_failed = False       # True jika face verify gagal
 
         # Scan results
         self.last_validated_nim = None
@@ -128,6 +129,8 @@ class StabilityTracker:
         self.phase = phase
         self.phase_start = time.time()
         self.consecutive_count = 0
+        if phase == ScanPhase.SCANNING:
+            self._face_failed = False
 
     @property
     def phase_elapsed(self) -> float:
@@ -165,10 +168,10 @@ class StabilityTracker:
             self._do_checkin()
             self.enter_phase(ScanPhase.COMPLETE)
         elif self.phase == ScanPhase.FACE_VERIFY:
-            # Verify timeout — check-in anyway
-            logger.warning("⚠️ Face verify timeout — check-in tanpa verifikasi wajah")
-            self._do_checkin()
-            self.enter_phase(ScanPhase.COMPLETE)
+            # Verify timeout — wajah TIDAK cocok → TOLAK
+            logger.warning("❌ Face verify timeout — wajah tidak cocok, check-in DITOLAK")
+            self._face_failed = True
+            self.enter_phase(ScanPhase.COOLDOWN)
         elif self.phase == ScanPhase.COMPLETE:
             self.enter_phase(ScanPhase.COOLDOWN)
         elif self.phase == ScanPhase.COOLDOWN:
@@ -190,6 +193,8 @@ class StabilityTracker:
         self.face_result = None
         self.last_validated_nim = None
         self.last_validated_name = None
+        self._face_failed = False
+        self._needs_enrollment = False
 
     def set_checkin_func(self, func):
         """Set the check_in function reference."""
@@ -374,7 +379,12 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
 
     elif phase == ScanPhase.COOLDOWN:
         remaining = stability.phase_remaining
-        draw_badge(display, f"SELESAI ({remaining:.0f}s)", COLOR_COOLDOWN)
+        if stability._face_failed:
+            draw_badge(display, "VERIFIKASI GAGAL", COLOR_DB_FAIL)
+            draw_center_text(display,
+                f"VERIFIKASI WAJAH GAGAL! ({remaining:.0f}s)", COLOR_DB_FAIL)
+        else:
+            draw_badge(display, f"SELESAI ({remaining:.0f}s)", COLOR_COOLDOWN)
 
     return display
 
