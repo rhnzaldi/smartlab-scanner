@@ -69,16 +69,18 @@ COLOR_DB_FAIL  = (80, 80, 255)    # red for DB not found
 REQUIRED_LABELS = {"text_nim", "text_nama"}
 MIN_STABLE_FRAMES = 3
 COOLDOWN_SECONDS = 3.0
-FACE_VERIFY_SECONDS = 5.0  # durasi timer face verify
-IDENTITY_SHOW_SECONDS = 2.0  # durasi tampilkan info identitas
-COMPLETE_SHOW_SECONDS = 2.0  # durasi tampilkan success
+FACE_VERIFY_SECONDS = 7.0   # durasi timer face verify
+FACE_ENROLL_SECONDS = 10.0  # durasi timer enrollment (pertama kali)
+IDENTITY_SHOW_SECONDS = 3.0 # delay sebelum face verify dimulai
+COMPLETE_SHOW_SECONDS = 2.0 # durasi tampilkan success
 
 
 class ScanPhase:
     """Fase scanning — state machine."""
     SCANNING = "scanning"           # 1. Menunggu KTM
     IDENTITY_FOUND = "identity"     # 2. Identitas ditemukan, tampilkan info
-    FACE_VERIFY = "face_verify"     # 3. Verifikasi wajah (5s timer)
+    FACE_ENROLL = "face_enroll"     # 3a. Pendaftaran wajah (pertama kali)
+    FACE_VERIFY = "face_verify"     # 3b. Verifikasi wajah (sudah terdaftar)
     COMPLETE = "complete"           # 4. Scan berhasil
     COOLDOWN = "cooldown"           # 5. Jeda sebelum scan berikutnya
 
@@ -94,6 +96,7 @@ class StabilityTracker:
         self.phase = ScanPhase.SCANNING
         self.phase_start = 0.0
         self.face_verify_enabled = face_verify_enabled
+        self._needs_enrollment = False  # True jika belum ada encoding di DB
 
         # Scan results
         self.last_validated_nim = None
@@ -135,6 +138,7 @@ class StabilityTracker:
         """Remaining time for timed phases."""
         durations = {
             ScanPhase.IDENTITY_FOUND: IDENTITY_SHOW_SECONDS,
+            ScanPhase.FACE_ENROLL: FACE_ENROLL_SECONDS,
             ScanPhase.FACE_VERIFY: FACE_VERIFY_SECONDS,
             ScanPhase.COMPLETE: COMPLETE_SHOW_SECONDS,
             ScanPhase.COOLDOWN: COOLDOWN_SECONDS,
@@ -148,14 +152,20 @@ class StabilityTracker:
         if remaining > 0:
             return
         if self.phase == ScanPhase.IDENTITY_FOUND:
-            if self.face_verify_enabled:
-                self.enter_phase(ScanPhase.FACE_VERIFY)
-            else:
-                # No face verify — do check-in and skip to COMPLETE
+            if not self.face_verify_enabled:
                 self._do_checkin()
                 self.enter_phase(ScanPhase.COMPLETE)
+            elif self._needs_enrollment:
+                self.enter_phase(ScanPhase.FACE_ENROLL)
+            else:
+                self.enter_phase(ScanPhase.FACE_VERIFY)
+        elif self.phase == ScanPhase.FACE_ENROLL:
+            # Enrollment timeout — check-in tanpa face
+            logger.warning("⚠️ Enrollment timeout — check-in tanpa registrasi wajah")
+            self._do_checkin()
+            self.enter_phase(ScanPhase.COMPLETE)
         elif self.phase == ScanPhase.FACE_VERIFY:
-            # Timeout — face not verified, check-in anyway
+            # Verify timeout — check-in anyway
             logger.warning("⚠️ Face verify timeout — check-in tanpa verifikasi wajah")
             self._do_checkin()
             self.enter_phase(ScanPhase.COMPLETE)
@@ -326,6 +336,19 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
                 f"Identitas cocok! Memproses... ({remaining:.0f}s)",
                 COLOR_DB_OK)
 
+    elif phase == ScanPhase.FACE_ENROLL:
+        remaining = stability.phase_remaining
+        draw_badge(display, f"REGISTRASI WAJAH ({remaining:.0f}s)", (255, 200, 0))
+        fr = stability.face_result
+        if fr and fr.get("success"):
+            draw_center_text(display, "WAJAH TERDAFTAR!", COLOR_DB_OK)
+        elif fr and fr.get("face_detected"):
+            draw_center_text(display,
+                "Wajah terdeteksi — mendaftarkan...", (255, 200, 0))
+        else:
+            draw_center_text(display,
+                f">> HADAP KE KAMERA << ({remaining:.0f}s)", (255, 200, 0))
+
     elif phase == ScanPhase.FACE_VERIFY:
         remaining = stability.phase_remaining
         draw_badge(display, f"VERIFIKASI WAJAH ({remaining:.0f}s)", COLOR_WARN)
@@ -384,7 +407,10 @@ def main():
         logger.warning(f"⚠️ pyzbar unavailable: {e}")
 
     # ── Init Database ──
-    from db.database import init_db, verify_student, check_in, check_out, reset_all_peminjaman
+    from db.database import (
+        init_db, verify_student, check_in, check_out,
+        reset_all_peminjaman, save_face_encoding, load_face_encoding,
+    )
     init_db()
 
     # ── Init Face Verifier ──
@@ -465,13 +491,21 @@ def main():
                     stability.last_validated_name = result.nama
 
                     if db_res["verified"]:
-                        # Set face reference from KTM
+                        nim = result.nim_final
                         if face_verifier:
-                            crops = pipeline.crop_detections(snap, pipeline.detect(snap))
-                            if "face_photo" in crops and crops["face_photo"].crop is not None:
-                                face_verifier.set_reference(crops["face_photo"].crop)
+                            # Check if encoding exists in DB
+                            db_encoding = load_face_encoding(nim)
+                            if db_encoding is not None:
+                                # Sudah punya encoding → langsung verify
+                                face_verifier.set_reference_from_encoding(db_encoding)
+                                stability._needs_enrollment = False
+                                logger.info(f"👤 Face encoding loaded dari DB untuk {nim}")
+                            else:
+                                # Belum ada encoding → enrollment
+                                stability._needs_enrollment = True
+                                logger.info(f"👤 Belum ada face encoding untuk {nim} → enrollment")
 
-                        # Enter IDENTITY_FOUND phase (2s show info)
+                        # Enter IDENTITY_FOUND phase
                         stability.enter_phase(ScanPhase.IDENTITY_FOUND)
                     else:
                         stability.checkin_result = None
@@ -554,11 +588,41 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WARN, 2)
 
             # ══════════════════════════════════════════════
-            # PATH B: FACE VERIFY ONLY (YOLO + OCR OFF)
+            # PATH B: FACE ENROLLMENT (pertama kali, YOLO OFF)
+            # ══════════════════════════════════════════════
+            elif stability.phase == ScanPhase.FACE_ENROLL:
+                display_result = ScanResult()
+                with ocr_lock:
+                    cached = ocr_cached
+                display_result.nim_final = cached.nim_final
+                display_result.nama = cached.nama
+                display_result.success = cached.success
+
+                if face_verifier:
+                    enroll_res = face_verifier.enroll(frame)
+                    stability.face_result = enroll_res
+
+                    # Draw face bbox (kuning untuk enrollment)
+                    if enroll_res.get("face_detected") and enroll_res.get("face_bbox"):
+                        fx, fy, fw, fh = enroll_res["face_bbox"]
+                        cv2.rectangle(display, (fx, fy), (fx+fw, fy+fh), (255, 200, 0), 3)
+                        cv2.putText(display, "Mendaftarkan...", (fx, fy - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2, cv2.LINE_AA)
+
+                    # Wajah berhasil di-capture → simpan encoding ke DB
+                    if enroll_res.get("success") and enroll_res.get("encoding") is not None:
+                        nim = stability.last_validated_nim
+                        if nim:
+                            save_face_encoding(nim, enroll_res["encoding"])
+                            logger.info(f"✅ Face enrolled dan disimpan ke DB untuk {nim}")
+                        stability._do_checkin()
+                        stability.enter_phase(ScanPhase.COMPLETE)
+
+            # ══════════════════════════════════════════════
+            # PATH C: FACE VERIFY (sudah terdaftar, YOLO OFF)
             # ══════════════════════════════════════════════
             elif stability.phase == ScanPhase.FACE_VERIFY:
                 display_result = ScanResult()
-                # Carry over cached OCR data for display
                 with ocr_lock:
                     cached = ocr_cached
                 display_result.nim_final = cached.nim_final

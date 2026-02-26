@@ -1,26 +1,18 @@
 """
 Smart-Lab SV IPB — Face Verification Module
-Bandingkan wajah live dari webcam dengan foto di KTM.
+Face enrollment + verification via webcam menggunakan dlib 128-D encoding.
 
-Menggunakan face_recognition (dlib) untuk 128-D face encoding:
-1. dlib HOG/CNN untuk deteksi wajah
-2. 128-dimensional face encoding untuk matching
-3. Euclidean distance untuk similarity score
+Flow:
+  1. ENROLLMENT (pertama kali):
+     Scan KTM → DB match → Capture wajah via webcam → Simpan encoding di DB
+  2. VERIFICATION (selanjutnya):
+     Scan KTM → DB match → Load encoding dari DB → Compare wajah live
 
-Usage:
-    from ml.face_verify import FaceVerifier
-    verifier = FaceVerifier()
-
-    # Simpan referensi dari KTM crop
-    verifier.set_reference(ktm_face_crop)
-
-    # Verify wajah live
-    result = verifier.verify(live_frame)
-    print(result["verified"], result["similarity"])
+Privacy: Hanya menyimpan 128 angka (encoding), BUKAN foto wajah.
 """
 
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 import cv2
 import numpy as np
@@ -28,7 +20,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────
-# Lazy-load face_recognition (heavy import)
+# Lazy-load face_recognition
 # ────────────────────────────────────────────────────────
 _face_recognition = None
 _fr_available = None
@@ -58,79 +50,82 @@ def _get_face_recognition():
 # ────────────────────────────────────────────────────────
 # Constants
 # ────────────────────────────────────────────────────────
-FACE_MATCH_TOLERANCE = 0.5      # euclidean distance threshold (lower = stricter)
-FACE_DETECTION_MODEL = "hog"    # "hog" (CPU, fast) or "cnn" (GPU, accurate)
+FACE_MATCH_TOLERANCE = 0.45      # euclidean distance (lower = stricter)
+FACE_DETECTION_MODEL = "hog"     # "hog" (CPU fast) or "cnn" (GPU accurate)
 
 
 class FaceVerifier:
     """
-    Verify wajah live vs referensi dari KTM.
+    Face enrollment + verification.
 
-    Flow:
-    1. set_reference(ktm_face_crop) — encode face dari foto KTM
-    2. verify(live_frame) — detect face live, compare encoding
+    Enrollment:  capture wajah live → encoding → simpan di DB
+    Verification: load encoding dari DB → compare wajah live
     """
 
     def __init__(self, tolerance: float = FACE_MATCH_TOLERANCE):
         self.tolerance = tolerance
-        self._ref_encoding = None   # 128-D numpy array
-        self._ref_image = None
+        self._ref_encoding = None   # 128-D numpy array (from DB)
         self._has_reference = False
 
-    def set_reference(self, face_crop: np.ndarray) -> bool:
+    def set_reference_from_encoding(self, encoding: np.ndarray) -> bool:
+        """Load encoding yang sudah di-save dari DB."""
+        if encoding is None or len(encoding) != 128:
+            return False
+        self._ref_encoding = encoding
+        self._has_reference = True
+        logger.info("✅ Face reference loaded from DB (128-D)")
+        return True
+
+    def enroll(self, live_frame: np.ndarray) -> Dict:
         """
-        Set foto referensi dari KTM face_photo crop.
-        Returns True jika berhasil mendeteksi dan encode wajah.
+        ENROLLMENT: Capture wajah dari webcam dan hasilkan encoding.
+        Returns encoding (128-D numpy array) jika berhasil.
+
+        Caller harus save encoding ke DB via save_face_encoding().
         """
+        result = {
+            "success": False,
+            "encoding": None,
+            "face_detected": False,
+            "face_bbox": None,
+            "message": "",
+        }
+
         fr = _get_face_recognition()
         if fr is None:
-            return False
+            result["message"] = "face_recognition not available"
+            return result
 
-        if face_crop is None or face_crop.size == 0:
-            logger.warning("⚠️ Face crop kosong")
-            return False
+        rgb = cv2.cvtColor(live_frame, cv2.COLOR_BGR2RGB)
+        face_locations = fr.face_locations(rgb, model=FACE_DETECTION_MODEL)
 
-        # face_recognition expects RGB (OpenCV gives BGR)
-        rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        if not face_locations:
+            result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
+            return result
 
-        # Upscale small crops for better detection
-        h, w = rgb.shape[:2]
-        if h < 100 or w < 80:
-            scale = max(100 / h, 80 / w)
-            rgb = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            logger.debug(f"  Upscaled face crop: {w}x{h} → {rgb.shape[1]}x{rgb.shape[0]}")
+        # Get largest face
+        largest_face = max(face_locations, key=lambda l: (l[2] - l[0]) * (l[1] - l[3]))
+        top, right, bottom, left = largest_face
 
-        # Get face encodings
-        encodings = fr.face_encodings(rgb)
+        result["face_detected"] = True
+        result["face_bbox"] = (left, top, right - left, bottom - top)
 
+        # Encode with high quality (num_jitters=5 for enrollment)
+        encodings = fr.face_encodings(rgb, known_face_locations=[largest_face],
+                                      num_jitters=5)
         if not encodings:
-            # KTM crop mungkin sudah berupa wajah (YOLO crop ketat)
-            # Coba tanpa face detection — encode seluruh gambar
-            encodings = fr.face_encodings(rgb, known_face_locations=[(0, rgb.shape[1], rgb.shape[0], 0)])
+            result["message"] = "Gagal encode wajah"
+            return result
 
-        if not encodings:
-            logger.warning("⚠️ Tidak bisa encode wajah dari KTM crop")
-            return False
-
-        self._ref_encoding = encodings[0]
-        self._ref_image = face_crop.copy()
-        self._has_reference = True
-        logger.info("✅ Face reference encoding set dari KTM (128-D)")
-        return self._has_reference
+        result["success"] = True
+        result["encoding"] = encodings[0]
+        result["message"] = "✅ Wajah berhasil di-capture"
+        logger.info("✅ Face enrollment: encoding captured (128-D, jitters=5)")
+        return result
 
     def verify(self, live_frame: np.ndarray) -> Dict:
         """
-        Verify wajah di live frame vs referensi.
-
-        Returns:
-            {
-                "verified": bool,
-                "similarity": float (0-1, higher = more similar),
-                "distance": float (euclidean, lower = more similar),
-                "face_detected": bool,
-                "message": str,
-                "face_bbox": (x, y, w, h) | None,
-            }
+        VERIFICATION: Compare wajah live vs encoding referensi dari DB.
         """
         result = {
             "verified": False,
@@ -143,46 +138,44 @@ class FaceVerifier:
 
         fr = _get_face_recognition()
         if fr is None or not self._has_reference:
-            result["message"] = "Face recognition not available" if fr is None else "No reference set"
+            result["message"] = "Not available" if fr is None else "No reference"
             return result
 
-        # Convert BGR → RGB
         rgb = cv2.cvtColor(live_frame, cv2.COLOR_BGR2RGB)
-
-        # Detect faces (HOG = fast CPU, CNN = accurate GPU)
         face_locations = fr.face_locations(rgb, model=FACE_DETECTION_MODEL)
 
         if not face_locations:
             result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
             return result
 
-        # Get largest face (closest to camera)
-        largest_face = max(face_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]))
+        # Largest face
+        largest_face = max(face_locations, key=lambda l: (l[2] - l[0]) * (l[1] - l[3]))
         top, right, bottom, left = largest_face
 
         result["face_detected"] = True
-        result["face_bbox"] = (left, top, right - left, bottom - top)  # (x, y, w, h)
+        result["face_bbox"] = (left, top, right - left, bottom - top)
 
-        # Encode live face
-        live_encodings = fr.face_encodings(rgb, known_face_locations=[largest_face])
+        # Encode live face (jitters=1 for speed)
+        live_encodings = fr.face_encodings(rgb, known_face_locations=[largest_face],
+                                           num_jitters=1)
         if not live_encodings:
-            result["message"] = "Error encoding wajah live"
+            result["message"] = "Error encoding wajah"
             return result
 
-        # Compare: euclidean distance
-        distance = fr.face_distance([self._ref_encoding], live_encodings[0])[0]
-        similarity = max(0.0, 1.0 - distance)  # convert distance to similarity (0-1)
+        # Compare
+        distance = float(fr.face_distance([self._ref_encoding], live_encodings[0])[0])
+        similarity = max(0.0, min(1.0, 1.0 - distance))
 
-        result["distance"] = round(float(distance), 3)
-        result["similarity"] = round(float(similarity), 2)
+        result["distance"] = round(distance, 3)
+        result["similarity"] = round(similarity, 2)
 
         if distance <= self.tolerance:
             result["verified"] = True
             result["message"] = f"✅ Wajah cocok ({similarity:.0%})"
-            logger.info(f"Face verified: distance={distance:.3f}, similarity={similarity:.0%}")
+            logger.info(f"Face MATCH: dist={distance:.3f} ≤ {self.tolerance}")
         else:
-            result["message"] = f"❌ Wajah tidak cocok ({similarity:.0%})"
-            logger.debug(f"Face mismatch: distance={distance:.3f}, similarity={similarity:.0%}")
+            result["message"] = f"Wajah tidak cocok ({similarity:.0%})"
+            logger.debug(f"Face REJECT: dist={distance:.3f} > {self.tolerance}")
 
         return result
 
@@ -193,5 +186,4 @@ class FaceVerifier:
     def clear_reference(self):
         """Reset referensi."""
         self._ref_encoding = None
-        self._ref_image = None
         self._has_reference = False

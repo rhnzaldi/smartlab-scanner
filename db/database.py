@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import Optional, Dict, List
 from difflib import SequenceMatcher
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────
@@ -89,9 +91,17 @@ def init_db():
                 prodi TEXT,
                 angkatan INTEGER,
                 status TEXT DEFAULT 'aktif',
+                face_encoding BLOB,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migration: add face_encoding column if table already exists without it
+        try:
+            cursor.execute("ALTER TABLE mahasiswa ADD COLUMN face_encoding BLOB")
+            logger.info("✅ Added face_encoding column to mahasiswa")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS peminjaman (
@@ -349,3 +359,53 @@ def reset_all_peminjaman() -> Dict:
 
     logger.info(f"🔄 Reset: {count} peminjaman aktif → selesai")
     return {"success": True, "message": f"🔄 Reset {count} peminjaman aktif", "count": count}
+
+
+# ────────────────────────────────────────────────────────
+# Face Encoding Storage
+# ────────────────────────────────────────────────────────
+@_timed_db_op
+def save_face_encoding(nim: str, encoding: np.ndarray) -> Dict:
+    """
+    Simpan face encoding (128-D numpy array) ke database.
+    Encoding disimpan sebagai BLOB (raw bytes, 512 bytes).
+    TIDAK menyimpan foto — hanya angka encoding.
+    """
+    with get_connection() as conn:
+        encoding_bytes = encoding.astype(np.float64).tobytes()
+        conn.execute(
+            "UPDATE mahasiswa SET face_encoding = ? WHERE nim = ?",
+            (encoding_bytes, nim)
+        )
+
+    logger.info(f"✅ Face encoding saved for {nim} ({len(encoding_bytes)} bytes)")
+    return {"success": True, "message": f"✅ Wajah terdaftar untuk {nim}"}
+
+
+@_timed_db_op
+def load_face_encoding(nim: str) -> Optional[np.ndarray]:
+    """
+    Load face encoding dari database.
+    Returns 128-D numpy array atau None jika belum ada.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT face_encoding FROM mahasiswa WHERE nim = ?", (nim,)
+        ).fetchone()
+
+    if row and row["face_encoding"]:
+        encoding = np.frombuffer(row["face_encoding"], dtype=np.float64)
+        logger.debug(f"  Face encoding loaded for {nim} ({len(encoding)}D)")
+        return encoding
+
+    return None
+
+
+@_timed_db_op
+def has_face_encoding(nim: str) -> bool:
+    """Check apakah mahasiswa sudah punya face encoding."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT face_encoding FROM mahasiswa WHERE nim = ?", (nim,)
+        ).fetchone()
+    return row is not None and row["face_encoding"] is not None
