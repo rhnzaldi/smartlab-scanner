@@ -38,15 +38,16 @@ def _get_face_app():
         try:
             from insightface.app import FaceAnalysis
             # Hanya load detection + recognition (skip landmark + genderage)
-            # Hemat ~100MB RAM
+            # Hemat ~100MB RAM, tidak pengaruh akurasi
             _face_app = FaceAnalysis(
                 name='buffalo_l',
                 providers=['CPUExecutionProvider'],
                 allowed_modules=['detection', 'recognition'],
             )
-            _face_app.prepare(ctx_id=-1, det_size=(320, 320))
+            # det_size lebih besar = deteksi wajah lebih akurat
+            _face_app.prepare(ctx_id=-1, det_size=(640, 640))
             _face_app_available = True
-            logger.info("✅ InsightFace ArcFace loaded (buffalo_l, detection+recognition only)")
+            logger.info("✅ InsightFace ArcFace loaded (buffalo_l, det_size=640)")
         except Exception as e:
             logger.error(f"❌ InsightFace gagal dimuat: {e}")
             _face_app_available = False
@@ -81,8 +82,6 @@ class FaceVerifier:
         self.threshold = threshold
         self._ref_embedding = None    # 512-D numpy array (from DB)
         self._has_reference = False
-        self._frame_count = 0         # Frame counter untuk skip logic
-        self._last_result = None      # Cache hasil verify terakhir
 
     def set_reference_from_encoding(self, embedding: np.ndarray) -> bool:
         """Load embedding yang sudah di-save dari DB."""
@@ -90,8 +89,6 @@ class FaceVerifier:
             return False
         self._ref_embedding = embedding.astype(np.float32)
         self._has_reference = True
-        self._frame_count = 0
-        self._last_result = None
         logger.info(f"✅ Face reference loaded from DB ({len(embedding)}-D)")
         return True
 
@@ -137,18 +134,11 @@ class FaceVerifier:
         logger.info(f"✅ Face enrollment: {len(largest.embedding)}-D ArcFace embedding")
         return result
 
-    def verify(self, live_frame: np.ndarray, skip_interval: int = 3) -> Dict:
+    def verify(self, live_frame: np.ndarray) -> Dict:
         """
         VERIFICATION: Compare wajah live vs embedding referensi dari DB.
-        
-        skip_interval: hanya proses setiap N frame (hemat CPU ~60%).
-                       Frame yang di-skip return hasil terakhir.
+        Proses setiap frame untuk akurasi real-time terbaik.
         """
-        # Frame skipping — return cached result
-        self._frame_count += 1
-        if self._last_result is not None and self._frame_count % skip_interval != 0:
-            return self._last_result
-
         result = {
             "verified": False,
             "similarity": 0.0,
@@ -167,7 +157,6 @@ class FaceVerifier:
 
         if not faces:
             result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
-            self._last_result = result
             return result
 
         # Largest face
@@ -179,7 +168,6 @@ class FaceVerifier:
 
         if largest.embedding is None:
             result["message"] = "Error encoding wajah"
-            self._last_result = result
             return result
 
         # Cosine similarity
@@ -194,7 +182,6 @@ class FaceVerifier:
             result["message"] = f"Wajah tidak cocok ({similarity:.0%})"
             logger.debug(f"Face REJECT: sim={similarity:.3f} < {self.threshold}")
 
-        self._last_result = result
         return result
 
     @property
@@ -205,5 +192,3 @@ class FaceVerifier:
         """Reset referensi."""
         self._ref_embedding = None
         self._has_reference = False
-        self._frame_count = 0
-        self._last_result = None

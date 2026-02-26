@@ -127,25 +127,204 @@ print("Training complete!")
 """
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  CELL 5: Validasi Model                                      ║
+# ║  CELL 5: Evaluasi Model (Metrics Lengkap untuk Laporan)     ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 CELL_5 = """
 # --- Jalankan di Colab Cell 5 ---
-from ultralytics import YOLO
+# Evaluasi model dengan metrik lengkap untuk laporan proyek
 
-# Load model terbaik dari training
+from ultralytics import YOLO
+import json
+
 model = YOLO("runs/detect/smartlab-ktm/weights/best.pt")
 
-# Validasi
-metrics = model.val()
+# ── Validasi pada dataset test/valid ──
+metrics = model.val(split="test")  # ganti "test" → "val" jika test set kosong
 
-print(f"\\nmAP50: {metrics.box.map50:.3f}")
-print(f"mAP50-95: {metrics.box.map:.3f}")
+# ═══════════════════════════════════════════
+# METRIK UTAMA (untuk laporan)
+# ═══════════════════════════════════════════
+print("=" * 60)
+print("     EVALUASI MODEL YOLOv8 — Smart-Lab KTM Scanner")
+print("=" * 60)
 
-# Print per-class results
-for i, name in enumerate(model.names.values()):
-    print(f"  {name}: AP50={metrics.box.ap50[i]:.3f}")
+# Overall metrics
+print(f"\\n📊 OVERALL METRICS:")
+print(f"  Precision (P):     {metrics.box.mp:.4f}  ({metrics.box.mp:.1%})")
+print(f"  Recall (R):        {metrics.box.mr:.4f}  ({metrics.box.mr:.1%})")
+print(f"  mAP@50:            {metrics.box.map50:.4f}  ({metrics.box.map50:.1%})")
+print(f"  mAP@50-95:         {metrics.box.map:.4f}  ({metrics.box.map:.1%})")
+
+# F1 Score (harmonic mean of P and R)
+p = metrics.box.mp
+r = metrics.box.mr
+f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0
+print(f"  F1 Score:          {f1:.4f}  ({f1:.1%})")
+
+# Per-class metrics
+class_names = list(model.names.values())
+print(f"\\n📋 PER-CLASS METRICS:")
+print(f"  {'Class':<15} {'Precision':>10} {'Recall':>10} {'AP@50':>10} {'AP@50-95':>10}")
+print(f"  {'-'*55}")
+
+for i, name in enumerate(class_names):
+    ap50 = metrics.box.ap50[i] if i < len(metrics.box.ap50) else 0
+    ap = metrics.box.ap[i] if i < len(metrics.box.ap) else 0
+    # Per-class P and R from metrics
+    pc = metrics.box.p[i] if i < len(metrics.box.p) else 0
+    rc = metrics.box.r[i] if i < len(metrics.box.r) else 0
+    print(f"  {name:<15} {pc:>10.4f} {rc:>10.4f} {ap50:>10.4f} {ap:>10.4f}")
+
+print(f"\\n  {'OVERALL':<15} {p:>10.4f} {r:>10.4f} {metrics.box.map50:>10.4f} {metrics.box.map:>10.4f}")
+
+# Speed metrics
+print(f"\\n⚡ SPEED (per image):")
+print(f"  Preprocessing:     {metrics.speed['preprocess']:.1f}ms")
+print(f"  Inference:         {metrics.speed['inference']:.1f}ms")
+print(f"  Postprocessing:    {metrics.speed['postprocess']:.1f}ms")
+total_speed = sum(metrics.speed.values())
+print(f"  Total:             {total_speed:.1f}ms ({1000/total_speed:.0f} FPS)")
+
+print(f"\\n" + "=" * 60)
+print(f"  F1 Score = {f1:.4f} | mAP@50 = {metrics.box.map50:.4f}")
+print("=" * 60)
+"""
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  CELL 5B: Visualisasi & Confusion Matrix                    ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+CELL_5B = """
+# --- Jalankan di Colab Cell 5B ---
+# Generate confusion matrix dan visualisasi training curves
+
+import matplotlib.pyplot as plt
+from matplotlib.image import imread
+import os
+import glob
+
+train_dir = "runs/detect/smartlab-ktm"
+
+# ── Confusion Matrix ──
+cm_path = os.path.join(train_dir, "confusion_matrix_normalized.png")
+if os.path.exists(cm_path):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(imread(cm_path))
+    plt.axis("off")
+    plt.title("Confusion Matrix (Normalized)", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    print("✅ Confusion Matrix — simpan untuk laporan!")
+else:
+    print("⚠️ Confusion matrix tidak ditemukan di:", cm_path)
+
+# ── Training Curves ──
+curves = [
+    ("results.png", "Training Results (Loss, Precision, Recall, mAP)"),
+    ("F1_curve.png", "F1-Confidence Curve"),
+    ("PR_curve.png", "Precision-Recall Curve"),
+    ("P_curve.png", "Precision-Confidence Curve"),
+    ("R_curve.png", "Recall-Confidence Curve"),
+]
+
+for fname, title in curves:
+    fpath = os.path.join(train_dir, fname)
+    if os.path.exists(fpath):
+        plt.figure(figsize=(12, 6))
+        plt.imshow(imread(fpath))
+        plt.axis("off")
+        plt.title(title, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"⚠️ {fname} tidak ditemukan")
+
+# ── Download semua plot sebagai ZIP ──
+import shutil
+plots_dir = "/content/evaluation_plots"
+os.makedirs(plots_dir, exist_ok=True)
+
+for fname, _ in curves:
+    src = os.path.join(train_dir, fname)
+    if os.path.exists(src):
+        shutil.copy(src, plots_dir)
+
+# Copy confusion matrices
+for cm in ["confusion_matrix.png", "confusion_matrix_normalized.png"]:
+    src = os.path.join(train_dir, cm)
+    if os.path.exists(src):
+        shutil.copy(src, plots_dir)
+
+# Zip and download
+shutil.make_archive("/content/evaluation_plots", "zip", plots_dir)
+from google.colab import files
+files.download("/content/evaluation_plots.zip")
+print("\\n✅ Semua plot evaluasi di-download sebagai evaluation_plots.zip")
+print("   Gunakan untuk laporan proyek!")
+"""
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  CELL 5C: Tabel Ringkasan (Copy-Paste ke Laporan)          ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+CELL_5C = """
+# --- Jalankan di Colab Cell 5C ---
+# Generate tabel ringkasan yang siap copy-paste ke laporan
+
+from ultralytics import YOLO
+
+model = YOLO("runs/detect/smartlab-ktm/weights/best.pt")
+metrics = model.val(split="test")
+
+class_names = list(model.names.values())
+p = metrics.box.mp
+r = metrics.box.mr
+f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0
+
+print("\\n" + "=" * 70)
+print("TABEL UNTUK LAPORAN (format Markdown — bisa paste ke Word/Docs)")
+print("=" * 70)
+
+# Tabel 1: Overall
+print("\\n### Tabel 1: Hasil Evaluasi Model YOLOv8 (Overall)")
+print("| Metrik | Nilai |")
+print("|--------|-------|")
+print(f"| Precision | {p:.4f} ({p:.1%}) |")
+print(f"| Recall | {r:.4f} ({r:.1%}) |")
+print(f"| F1 Score | {f1:.4f} ({f1:.1%}) |")
+print(f"| mAP@50 | {metrics.box.map50:.4f} ({metrics.box.map50:.1%}) |")
+print(f"| mAP@50-95 | {metrics.box.map:.4f} ({metrics.box.map:.1%}) |")
+total_speed = sum(metrics.speed.values())
+print(f"| Inference Speed | {metrics.speed['inference']:.1f}ms/image |")
+
+# Tabel 2: Per-Class
+print("\\n### Tabel 2: Evaluasi Per-Kelas Objek")
+print("| Kelas | Precision | Recall | F1 | AP@50 |")
+print("|-------|-----------|--------|----|-------|")
+for i, name in enumerate(class_names):
+    pc = metrics.box.p[i] if i < len(metrics.box.p) else 0
+    rc = metrics.box.r[i] if i < len(metrics.box.r) else 0
+    f1c = 2 * (pc * rc) / (pc + rc) if (pc + rc) > 0 else 0
+    ap50 = metrics.box.ap50[i] if i < len(metrics.box.ap50) else 0
+    print(f"| {name} | {pc:.4f} | {rc:.4f} | {f1c:.4f} | {ap50:.4f} |")
+
+# Tabel 3: Konfigurasi Training
+print("\\n### Tabel 3: Konfigurasi Training")
+print("| Parameter | Nilai |")
+print("|-----------|-------|")
+print("| Model | YOLOv8n (Nano) |")
+print("| Pre-trained | COCO dataset |")
+print("| Epochs | 200 |")
+print("| Image Size | 640×640 |")
+print("| Batch Size | 16 |")
+print("| Optimizer | AdamW |")
+print("| Learning Rate | 0.01 (auto) |")
+print("| Augmentation | Mosaic, Mixup, HSV, Flip, Rotation |")
+
+print("\\n" + "=" * 70)
+print("✅ Copy tabel di atas ke laporan proyek Anda!")
+print("=" * 70)
 """
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -218,7 +397,9 @@ if __name__ == "__main__":
         ("CELL 3", "Download Dataset (Roboflow)", CELL_3),
         ("CELL 3B", "⭐ AUGMENTASI DATASET (valid & test)", CELL_3B),
         ("CELL 4", "Training YOLOv8", CELL_4),
-        ("CELL 5", "Validasi Model", CELL_5),
+        ("CELL 5", "📊 Evaluasi Model (Metrik Lengkap)", CELL_5),
+        ("CELL 5B", "📈 Confusion Matrix & Training Curves", CELL_5B),
+        ("CELL 5C", "📋 Tabel Ringkasan (Copy ke Laporan)", CELL_5C),
         ("CELL 6", "Test Prediksi", CELL_6),
         ("CELL 7", "Download Model", CELL_7),
     ]
