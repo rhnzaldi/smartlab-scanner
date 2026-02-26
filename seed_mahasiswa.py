@@ -18,6 +18,8 @@ from db.database import init_db, get_connection
 # ════════════════════════════════════════════════════════
 MAHASISWA = [
     ("J0403231061", "Muhammad Raihan Zaldiputra", "TPL", 2023),
+    ("J0403231105", "Raffa Danendra Pramono", "TPL", 2023),
+    ("J0403231052", "Keisyah Zahra Anatasya", "TPL", 2023),
     
 ]
 

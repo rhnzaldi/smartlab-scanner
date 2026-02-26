@@ -509,41 +509,38 @@ def main():
         if not paused and pipeline.is_ready():
             pipeline.confidence_threshold = conf_threshold
 
-            # ── 1. YOLO detection (every frame, ~40ms) ──
-            detections = pipeline.detect(frame)
-            crops = pipeline.crop_detections(frame, detections) if detections else {}
-
-            # Build display result
-            display_result = ScanResult()
-            display_result.detections_found = list(crops.keys())
-            display_result.confidences = {k: round(v.confidence, 3) for k, v in crops.items()}
-            display_result.bboxes = {k: v.bbox for k, v in crops.items()}
-
-            # Overlay cached OCR data
-            with ocr_lock:
-                cached = ocr_cached
-                busy = ocr_busy
-
-            display_result.nim_qr = cached.nim_qr
-            display_result.nim_ocr = cached.nim_ocr
-            display_result.nim_final = cached.nim_final
-            display_result.nama = cached.nama
-            display_result.nim_match = cached.nim_match
-            display_result.validation_detail = cached.validation_detail
-            display_result.success = cached.success
-            if cached.success:
-                display_result.status = cached.status
-            display_result.inference_time_ms = cached.inference_time_ms
-            display_result.total_time_ms = cached.total_time_ms
-
-            # ── 2. Phase-based logic ──
-            detected_set = set(crops.keys())
-
             # Auto-advance timed phases
             stability.check_phase_timeout()
 
-            # SCANNING phase: stability check + trigger OCR
+            # ══════════════════════════════════════════════
+            # PATH A: YOLO + OCR (only during SCANNING)
+            # ══════════════════════════════════════════════
             if stability.phase == ScanPhase.SCANNING:
+                detections = pipeline.detect(frame)
+                crops = pipeline.crop_detections(frame, detections) if detections else {}
+
+                display_result = ScanResult()
+                display_result.detections_found = list(crops.keys())
+                display_result.confidences = {k: round(v.confidence, 3) for k, v in crops.items()}
+                display_result.bboxes = {k: v.bbox for k, v in crops.items()}
+
+                with ocr_lock:
+                    cached = ocr_cached
+                    busy = ocr_busy
+
+                display_result.nim_qr = cached.nim_qr
+                display_result.nim_ocr = cached.nim_ocr
+                display_result.nim_final = cached.nim_final
+                display_result.nama = cached.nama
+                display_result.nim_match = cached.nim_match
+                display_result.validation_detail = cached.validation_detail
+                display_result.success = cached.success
+                if cached.success:
+                    display_result.status = cached.status
+                display_result.inference_time_ms = cached.inference_time_ms
+                display_result.total_time_ms = cached.total_time_ms
+
+                detected_set = set(crops.keys())
                 should_ocr = stability.update(detected_set)
                 if should_ocr and not busy:
                     logger.info(f"🔍 KTM stabil → triggering OCR...")
@@ -552,16 +549,27 @@ def main():
                         ocr_snapshot = frame.copy()
                     ocr_trigger.set()
 
-            # IDENTITY_FOUND → handled by check_phase_timeout
-            # (no extra logic needed here)
+                if busy:
+                    cv2.putText(display, "OCR Processing...", (10, display.shape[0] - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WARN, 2)
 
-            # FACE_VERIFY phase: run face detection each frame
+            # ══════════════════════════════════════════════
+            # PATH B: FACE VERIFY ONLY (YOLO + OCR OFF)
+            # ══════════════════════════════════════════════
             elif stability.phase == ScanPhase.FACE_VERIFY:
+                display_result = ScanResult()
+                # Carry over cached OCR data for display
+                with ocr_lock:
+                    cached = ocr_cached
+                display_result.nim_final = cached.nim_final
+                display_result.nama = cached.nama
+                display_result.success = cached.success
+
                 if face_verifier and face_verifier.has_reference:
                     face_res = face_verifier.verify(frame)
                     stability.face_result = face_res
 
-                    # Draw face bbox on display
+                    # Draw face bbox
                     if face_res["face_detected"] and face_res["face_bbox"]:
                         fx, fy, fw, fh = face_res["face_bbox"]
                         fc = COLOR_DB_OK if face_res["verified"] else COLOR_WARN
@@ -576,10 +584,16 @@ def main():
                         stability._do_checkin()
                         stability.enter_phase(ScanPhase.COMPLETE)
 
-            # Show busy indicator
-            if busy:
-                cv2.putText(display, "OCR...", (display.shape[1] - 130, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WARN, 2, cv2.LINE_AA)
+            # ══════════════════════════════════════════════
+            # PATH C: NO PROCESSING (IDENTITY_FOUND / COMPLETE / COOLDOWN)
+            # ══════════════════════════════════════════════
+            else:
+                display_result = ScanResult()
+                with ocr_lock:
+                    cached = ocr_cached
+                display_result.nim_final = cached.nim_final
+                display_result.nama = cached.nama
+                display_result.success = cached.success
 
             display = draw_results(display, display_result, conf_threshold,
                                    stability, fps)
