@@ -288,13 +288,15 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
         color = COLOR_DB_OK if ci.get("success") else COLOR_WARN
         panel_lines.append((ci["message"], color))
 
-    # Face verify result
+    # Face result (verify or enroll)
     fr = stability.face_result
-    if fr and phase in (ScanPhase.FACE_VERIFY, ScanPhase.COMPLETE):
+    if fr and phase in (ScanPhase.FACE_ENROLL, ScanPhase.FACE_VERIFY, ScanPhase.COMPLETE):
         if fr.get("verified"):
-            panel_lines.append((f"Face: {fr['similarity']:.0%} COCOK", COLOR_DB_OK))
+            panel_lines.append((f"Face: {fr.get('similarity', 0):.0%} COCOK", COLOR_DB_OK))
+        elif fr.get("success") and fr.get("encoding") is not None:
+            panel_lines.append(("Face: TERDAFTAR ✅", COLOR_DB_OK))
         elif fr.get("face_detected"):
-            panel_lines.append((f"Face: {fr['similarity']:.0%}", COLOR_WARN))
+            panel_lines.append((f"Face: {fr.get('similarity', 0):.0%}", COLOR_WARN))
 
     panel_lines.append(("", None))
     panel_lines.append((f"FPS: {fps:.1f}", COLOR_INFO))
@@ -327,13 +329,17 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
     elif phase == ScanPhase.IDENTITY_FOUND:
         remaining = stability.phase_remaining
         draw_badge(display, "IDENTITAS DITEMUKAN", COLOR_DB_OK)
-        if stability.face_verify_enabled:
-            draw_center_text(display,
-                f"Identitas cocok! Siapkan wajah... ({remaining:.0f}s)",
-                COLOR_DB_OK)
-        else:
+        if not stability.face_verify_enabled:
             draw_center_text(display,
                 f"Identitas cocok! Memproses... ({remaining:.0f}s)",
+                COLOR_DB_OK)
+        elif stability._needs_enrollment:
+            draw_center_text(display,
+                f"Wajah belum terdaftar \u2014 siap registrasi... ({remaining:.0f}s)",
+                (255, 200, 0))
+        else:
+            draw_center_text(display,
+                f"Identitas cocok! Siapkan verifikasi... ({remaining:.0f}s)",
                 COLOR_DB_OK)
 
     elif phase == ScanPhase.FACE_ENROLL:
@@ -531,7 +537,7 @@ def main():
     logger.info("Starting scan. Press 'q' to quit.")
     print(f"\n  [q] Quit | [s] Save | [SPACE] Pause | [+/-] Confidence")
     print(f"  [o] Force OCR | [c] Check-out | [r] Reset peminjaman")
-    print(f"  Stability: {MIN_STABLE_FRAMES} frames | Cooldown: {COOLDOWN_SECONDS}s\n")
+    print(f"  [f] Reset face encoding | Stability: {MIN_STABLE_FRAMES} frames\n")
 
     while True:
         ret, frame = cap.read()
@@ -711,6 +717,18 @@ def main():
             with ocr_lock:
                 ocr_cached = ScanResult()
             logger.info("🔄 State di-reset — siap scan ulang")
+        elif key == ord("f"):
+            from db.database import get_connection
+            with get_connection() as conn:
+                conn.execute('UPDATE mahasiswa SET face_encoding = NULL')
+            res2 = reset_all_peminjaman()
+            logger.info(f"🧹 Face encoding di-reset untuk semua mahasiswa")
+            logger.info(f"🔄 {res2['message']}")
+            stability.reset_state()
+            with ocr_lock:
+                ocr_cached = ScanResult()
+            if face_verifier:
+                face_verifier.clear_reference()
 
     # ── Cleanup ──
     should_quit.set()

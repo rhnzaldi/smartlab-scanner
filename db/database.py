@@ -367,12 +367,12 @@ def reset_all_peminjaman() -> Dict:
 @_timed_db_op
 def save_face_encoding(nim: str, encoding: np.ndarray) -> Dict:
     """
-    Simpan face encoding (128-D numpy array) ke database.
-    Encoding disimpan sebagai BLOB (raw bytes, 512 bytes).
+    Simpan face encoding (512-D numpy array) ke database.
+    Encoding disimpan sebagai BLOB (raw bytes, ~2KB).
     TIDAK menyimpan foto — hanya angka encoding.
     """
     with get_connection() as conn:
-        encoding_bytes = encoding.astype(np.float64).tobytes()
+        encoding_bytes = encoding.astype(np.float32).tobytes()
         conn.execute(
             "UPDATE mahasiswa SET face_encoding = ? WHERE nim = ?",
             (encoding_bytes, nim)
@@ -386,7 +386,7 @@ def save_face_encoding(nim: str, encoding: np.ndarray) -> Dict:
 def load_face_encoding(nim: str) -> Optional[np.ndarray]:
     """
     Load face encoding dari database.
-    Returns 128-D numpy array atau None jika belum ada.
+    Returns 512-D numpy array (float32) atau None jika belum ada.
     """
     with get_connection() as conn:
         row = conn.execute(
@@ -394,7 +394,7 @@ def load_face_encoding(nim: str) -> Optional[np.ndarray]:
         ).fetchone()
 
     if row and row["face_encoding"]:
-        encoding = np.frombuffer(row["face_encoding"], dtype=np.float64)
+        encoding = np.frombuffer(row["face_encoding"], dtype=np.float32)
         logger.debug(f"  Face encoding loaded for {nim} ({len(encoding)}D)")
         return encoding
 

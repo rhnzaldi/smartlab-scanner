@@ -1,14 +1,17 @@
 """
-Smart-Lab SV IPB — Face Verification Module
-Face enrollment + verification via webcam menggunakan dlib 128-D encoding.
+Smart-Lab SV IPB — Face Verification Module (InsightFace ArcFace)
+Face enrollment + verification via webcam.
+
+Engine: InsightFace buffalo_l (ArcFace w600k_r50)
+- 512-D face embedding (vs 128-D dlib)
+- 99.5%+ akurasi untuk wajah Asia
+- ~50-80ms per frame via ONNX Runtime
 
 Flow:
-  1. ENROLLMENT (pertama kali):
-     Scan KTM → DB match → Capture wajah via webcam → Simpan encoding di DB
-  2. VERIFICATION (selanjutnya):
-     Scan KTM → DB match → Load encoding dari DB → Compare wajah live
+  1. ENROLLMENT: Capture wajah via webcam → 512-D embedding → simpan di DB
+  2. VERIFICATION: Load embedding dari DB → compare wajah live
 
-Privacy: Hanya menyimpan 128 angka (encoding), BUKAN foto wajah.
+Privacy: Hanya menyimpan 512 angka (embedding), BUKAN foto wajah.
 """
 
 import logging
@@ -20,68 +23,76 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────
-# Lazy-load face_recognition
+# Lazy-load InsightFace (heavy model loading)
 # ────────────────────────────────────────────────────────
-_face_recognition = None
-_fr_available = None
+_face_app = None
+_face_app_available = None
 
 
-def _get_face_recognition():
-    """Lazy-load face_recognition module."""
-    global _face_recognition, _fr_available
-    if _fr_available is False:
+def _get_face_app():
+    """Lazy-load InsightFace FaceAnalysis."""
+    global _face_app, _face_app_available
+    if _face_app_available is False:
         return None
-    if _face_recognition is None:
+    if _face_app is None:
         try:
-            import face_recognition
-            _face_recognition = face_recognition
-            _fr_available = True
-            logger.info("✅ face_recognition (dlib) loaded")
-        except ImportError:
-            logger.error(
-                "❌ face_recognition not installed.\n"
-                "   Install: conda install -c conda-forge dlib && pip install face_recognition"
+            from insightface.app import FaceAnalysis
+            _face_app = FaceAnalysis(
+                name='buffalo_l',
+                providers=['CPUExecutionProvider'],
             )
-            _fr_available = False
+            # det_size kecil = lebih cepat, cukup untuk webcam
+            _face_app.prepare(ctx_id=-1, det_size=(320, 320))
+            _face_app_available = True
+            logger.info("✅ InsightFace ArcFace loaded (buffalo_l, ONNX CPU)")
+        except Exception as e:
+            logger.error(f"❌ InsightFace gagal dimuat: {e}")
+            _face_app_available = False
             return None
-    return _face_recognition
+    return _face_app
 
 
 # ────────────────────────────────────────────────────────
 # Constants
 # ────────────────────────────────────────────────────────
-FACE_MATCH_TOLERANCE = 0.45      # euclidean distance (lower = stricter)
-FACE_DETECTION_MODEL = "hog"     # "hog" (CPU fast) or "cnn" (GPU accurate)
+FACE_MATCH_THRESHOLD = 0.4   # cosine similarity (higher = stricter, range 0-1)
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Hitung cosine similarity antara dua embedding."""
+    dot = np.dot(a, b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    if norm == 0:
+        return 0.0
+    return float(dot / norm)
 
 
 class FaceVerifier:
     """
-    Face enrollment + verification.
+    Face enrollment + verification menggunakan InsightFace ArcFace.
 
-    Enrollment:  capture wajah live → encoding → simpan di DB
-    Verification: load encoding dari DB → compare wajah live
+    Enrollment:  capture wajah live → 512-D embedding → simpan di DB
+    Verification: load embedding dari DB → compare wajah live
     """
 
-    def __init__(self, tolerance: float = FACE_MATCH_TOLERANCE):
-        self.tolerance = tolerance
-        self._ref_encoding = None   # 128-D numpy array (from DB)
+    def __init__(self, threshold: float = FACE_MATCH_THRESHOLD):
+        self.threshold = threshold
+        self._ref_embedding = None    # 512-D numpy array (from DB)
         self._has_reference = False
 
-    def set_reference_from_encoding(self, encoding: np.ndarray) -> bool:
-        """Load encoding yang sudah di-save dari DB."""
-        if encoding is None or len(encoding) != 128:
+    def set_reference_from_encoding(self, embedding: np.ndarray) -> bool:
+        """Load embedding yang sudah di-save dari DB."""
+        if embedding is None or len(embedding) < 64:
             return False
-        self._ref_encoding = encoding
+        self._ref_embedding = embedding.astype(np.float32)
         self._has_reference = True
-        logger.info("✅ Face reference loaded from DB (128-D)")
+        logger.info(f"✅ Face reference loaded from DB ({len(embedding)}-D)")
         return True
 
     def enroll(self, live_frame: np.ndarray) -> Dict:
         """
-        ENROLLMENT: Capture wajah dari webcam dan hasilkan encoding.
-        Returns encoding (128-D numpy array) jika berhasil.
-
-        Caller harus save encoding ke DB via save_face_encoding().
+        ENROLLMENT: Capture wajah dari webcam dan hasilkan embedding.
+        Returns embedding (512-D numpy array) jika berhasil.
         """
         result = {
             "success": False,
@@ -91,91 +102,82 @@ class FaceVerifier:
             "message": "",
         }
 
-        fr = _get_face_recognition()
-        if fr is None:
-            result["message"] = "face_recognition not available"
+        app = _get_face_app()
+        if app is None:
+            result["message"] = "InsightFace not available"
             return result
 
+        # InsightFace expects RGB
         rgb = cv2.cvtColor(live_frame, cv2.COLOR_BGR2RGB)
-        face_locations = fr.face_locations(rgb, model=FACE_DETECTION_MODEL)
+        faces = app.get(rgb)
 
-        if not face_locations:
+        if not faces:
             result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
             return result
 
-        # Get largest face
-        largest_face = max(face_locations, key=lambda l: (l[2] - l[0]) * (l[1] - l[3]))
-        top, right, bottom, left = largest_face
+        # Get largest face (closest to camera)
+        largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        x1, y1, x2, y2 = [int(v) for v in largest.bbox]
 
         result["face_detected"] = True
-        result["face_bbox"] = (left, top, right - left, bottom - top)
+        result["face_bbox"] = (x1, y1, x2 - x1, y2 - y1)
 
-        # Encode with high quality (num_jitters=5 for enrollment)
-        encodings = fr.face_encodings(rgb, known_face_locations=[largest_face],
-                                      num_jitters=5)
-        if not encodings:
+        if largest.embedding is None:
             result["message"] = "Gagal encode wajah"
             return result
 
         result["success"] = True
-        result["encoding"] = encodings[0]
+        result["encoding"] = largest.embedding  # 512-D float32
         result["message"] = "✅ Wajah berhasil di-capture"
-        logger.info("✅ Face enrollment: encoding captured (128-D, jitters=5)")
+        logger.info(f"✅ Face enrollment: {len(largest.embedding)}-D ArcFace embedding")
         return result
 
     def verify(self, live_frame: np.ndarray) -> Dict:
         """
-        VERIFICATION: Compare wajah live vs encoding referensi dari DB.
+        VERIFICATION: Compare wajah live vs embedding referensi dari DB.
         """
         result = {
             "verified": False,
             "similarity": 0.0,
-            "distance": 1.0,
             "face_detected": False,
             "message": "",
             "face_bbox": None,
         }
 
-        fr = _get_face_recognition()
-        if fr is None or not self._has_reference:
-            result["message"] = "Not available" if fr is None else "No reference"
+        app = _get_face_app()
+        if app is None or not self._has_reference:
+            result["message"] = "Not available" if app is None else "No reference"
             return result
 
         rgb = cv2.cvtColor(live_frame, cv2.COLOR_BGR2RGB)
-        face_locations = fr.face_locations(rgb, model=FACE_DETECTION_MODEL)
+        faces = app.get(rgb)
 
-        if not face_locations:
+        if not faces:
             result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
             return result
 
         # Largest face
-        largest_face = max(face_locations, key=lambda l: (l[2] - l[0]) * (l[1] - l[3]))
-        top, right, bottom, left = largest_face
+        largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        x1, y1, x2, y2 = [int(v) for v in largest.bbox]
 
         result["face_detected"] = True
-        result["face_bbox"] = (left, top, right - left, bottom - top)
+        result["face_bbox"] = (x1, y1, x2 - x1, y2 - y1)
 
-        # Encode live face (jitters=1 for speed)
-        live_encodings = fr.face_encodings(rgb, known_face_locations=[largest_face],
-                                           num_jitters=1)
-        if not live_encodings:
+        if largest.embedding is None:
             result["message"] = "Error encoding wajah"
             return result
 
-        # Compare
-        distance = float(fr.face_distance([self._ref_encoding], live_encodings[0])[0])
-        similarity = max(0.0, min(1.0, 1.0 - distance))
+        # Cosine similarity
+        similarity = _cosine_similarity(self._ref_embedding, largest.embedding)
+        result["similarity"] = round(max(0.0, similarity), 2)
 
-        result["distance"] = round(distance, 3)
-        result["similarity"] = round(similarity, 2)
-
-        if distance <= self.tolerance:
+        if similarity >= self.threshold:
             result["verified"] = True
             result["message"] = f"✅ Wajah cocok ({similarity:.0%})"
-            logger.info(f"Face MATCH: dist={distance:.3f} ≤ {self.tolerance}")
+            logger.info(f"Face MATCH: sim={similarity:.3f} ≥ {self.threshold}")
         else:
             result["message"] = f"Wajah tidak cocok ({similarity:.0%})"
-            logger.debug(f"Face REJECT: dist={distance:.3f} > {self.tolerance}")
+            logger.debug(f"Face REJECT: sim={similarity:.3f} < {self.threshold}")
 
         return result
 
@@ -185,5 +187,5 @@ class FaceVerifier:
 
     def clear_reference(self):
         """Reset referensi."""
-        self._ref_encoding = None
+        self._ref_embedding = None
         self._has_reference = False
