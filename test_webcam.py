@@ -68,6 +68,7 @@ COLOR_DB_FAIL  = (80, 80, 255)    # red for DB not found
 # ────────────────────────────────────────────────────────
 REQUIRED_LABELS = {"text_nim", "text_nama"}
 MIN_STABLE_FRAMES = 3
+ENROLLMENT_NAME_THRESHOLD = 0.70  # Enrollment butuh 70%+ nama cocok (anti salah NIM)
 COOLDOWN_SECONDS = 3.0
 FACE_VERIFY_SECONDS = 7.0   # durasi timer face verify
 FACE_ENROLL_SECONDS = 10.0  # durasi timer enrollment (pertama kali)
@@ -98,6 +99,7 @@ class StabilityTracker:
         self.face_verify_enabled = face_verify_enabled
         self._needs_enrollment = False  # True jika belum ada encoding di DB
         self._face_failed = False       # True jika face verify gagal
+        self._name_mismatch = False     # True jika nama OCR beda jauh dengan DB
 
         # Scan results
         self.last_validated_nim = None
@@ -131,6 +133,7 @@ class StabilityTracker:
         self.consecutive_count = 0
         if phase == ScanPhase.SCANNING:
             self._face_failed = False
+            self._name_mismatch = False
 
     @property
     def phase_elapsed(self) -> float:
@@ -195,6 +198,7 @@ class StabilityTracker:
         self.last_validated_name = None
         self._face_failed = False
         self._needs_enrollment = False
+        self._name_mismatch = False
 
     def set_checkin_func(self, func):
         """Set the check_in function reference."""
@@ -333,19 +337,26 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
 
     elif phase == ScanPhase.IDENTITY_FOUND:
         remaining = stability.phase_remaining
+        db = stability.db_result
+        db_nama = db.get("nama_db", "-") if db else "-"
         draw_badge(display, "IDENTITAS DITEMUKAN", COLOR_DB_OK)
         if not stability.face_verify_enabled:
             draw_center_text(display,
                 f"Identitas cocok! Memproses... ({remaining:.0f}s)",
                 COLOR_DB_OK)
         elif stability._needs_enrollment:
+            # Tampilkan nama DB besar agar user bisa konfirmasi visual
             draw_center_text(display,
-                f"Wajah belum terdaftar \u2014 siap registrasi... ({remaining:.0f}s)",
-                (255, 200, 0))
+                f"{db_nama}", (255, 200, 0), y_offset=-30)
+            draw_center_text(display,
+                f"Siap registrasi wajah... ({remaining:.0f}s)",
+                (255, 200, 0), y_offset=10)
         else:
             draw_center_text(display,
-                f"Identitas cocok! Siapkan verifikasi... ({remaining:.0f}s)",
-                COLOR_DB_OK)
+                f"{db_nama}", COLOR_DB_OK, y_offset=-30)
+            draw_center_text(display,
+                f"Siapkan verifikasi... ({remaining:.0f}s)",
+                COLOR_DB_OK, y_offset=10)
 
     elif phase == ScanPhase.FACE_ENROLL:
         remaining = stability.phase_remaining
@@ -379,7 +390,11 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
 
     elif phase == ScanPhase.COOLDOWN:
         remaining = stability.phase_remaining
-        if stability._face_failed:
+        if stability._name_mismatch:
+            draw_badge(display, "NAMA TIDAK COCOK", COLOR_DB_FAIL)
+            draw_center_text(display,
+                f"NAMA TIDAK COCOK — NIM SALAH? ({remaining:.0f}s)", COLOR_DB_FAIL)
+        elif stability._face_failed:
             draw_badge(display, "VERIFIKASI GAGAL", COLOR_DB_FAIL)
             draw_center_text(display,
                 f"VERIFIKASI WAJAH GAGAL! ({remaining:.0f}s)", COLOR_DB_FAIL)
@@ -508,6 +523,7 @@ def main():
 
                     if db_res["verified"]:
                         nim = result.nim_final
+                        name_sim = db_res.get("name_similarity", 0)
                         if face_verifier:
                             # Check if encoding exists in DB
                             db_encoding = load_face_encoding(nim)
@@ -517,9 +533,22 @@ def main():
                                 stability._needs_enrollment = False
                                 logger.info(f"👤 Face encoding loaded dari DB untuk {nim}")
                             else:
-                                # Belum ada encoding → enrollment
-                                stability._needs_enrollment = True
-                                logger.info(f"👤 Belum ada face encoding untuk {nim} → enrollment")
+                                # Belum ada encoding → cek nama dulu sebelum enrollment
+                                if name_sim >= ENROLLMENT_NAME_THRESHOLD:
+                                    stability._needs_enrollment = True
+                                    logger.info(
+                                        f"👤 Enrollment OK: nama cocok {name_sim:.0%} "
+                                        f"(OCR='{result.nama}' vs DB='{db_res.get('nama_db')}')")
+                                else:
+                                    # Nama terlalu beda → tolak enrollment!
+                                    stability._needs_enrollment = False
+                                    stability._name_mismatch = True
+                                    logger.warning(
+                                        f"🚫 Enrollment DITOLAK: nama hanya {name_sim:.0%} "
+                                        f"(OCR='{result.nama}' vs DB='{db_res.get('nama_db')}') "
+                                        f"— kemungkinan NIM salah baca!")
+                                    stability.enter_phase(ScanPhase.COOLDOWN)
+                                    continue
 
                         # Enter IDENTITY_FOUND phase
                         stability.enter_phase(ScanPhase.IDENTITY_FOUND)
