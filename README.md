@@ -90,6 +90,17 @@ python test_webcam.py
 
 # 6. Atau jalankan API server
 python main.py
+
+# 1. Clone repository
+git clone https://github.com/rhnzaldi/smartlab-scanner.git
+cd smartlab-scanner
+
+# 2. Pindah ke branch khusus Windows GPU
+git checkout windows-gpu
+
+# 3. Install packages (Akan otomatis download versi GPU)
+pip install -r requirements.txt
+
 ```
 
 ### macOS — Jika ada error library:
