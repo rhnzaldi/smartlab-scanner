@@ -164,9 +164,11 @@ def _process_scan_result(result: ScanResult) -> dict:
         response["db_nama"] = db_res.get("nama_db")
         response["db_prodi"] = db_res.get("prodi")
         response["db_message"] = db_res.get("message")
+        
+        # [SECURITY FIX] API tidak lagi auto check-in.
+        # Check-in harus dilakukan melalui endpoint khusus face verify nanti.
         if db_res["verified"]:
-            ci_res = check_in(result.nim_final)
-            response["checkin"] = ci_res
+            response["action_required"] = "face_verification"
 
     return response
 

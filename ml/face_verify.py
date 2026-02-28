@@ -41,7 +41,7 @@ def _get_face_app():
             # Hemat ~100MB RAM, tidak pengaruh akurasi
             _face_app = FaceAnalysis(
                 name='buffalo_l',
-                providers=['CPUExecutionProvider'],
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                 allowed_modules=['detection', 'recognition'],
             )
             # det_size lebih besar = deteksi wajah lebih akurat

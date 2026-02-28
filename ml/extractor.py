@@ -39,8 +39,8 @@ def _get_paddle_ocr():
         try:
             logger.info("⏳ Loading PaddleOCR (first time, may take a moment)...")
             from paddleocr import PaddleOCR
-            _paddle_ocr_instance = PaddleOCR(lang="en")
-            logger.info("✅ PaddleOCR loaded successfully.")
+            _paddle_ocr_instance = PaddleOCR(lang="en", use_gpu=True)
+            logger.info("✅ PaddleOCR loaded successfully (GPU enabled).")
         except Exception as e:
             logger.error(f"❌ PaddleOCR init failed: {e}")
             _paddle_ocr_init_failed = True
