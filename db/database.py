@@ -17,7 +17,7 @@ import functools
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -409,3 +409,16 @@ def has_face_encoding(nim: str) -> bool:
             "SELECT face_encoding FROM mahasiswa WHERE nim = ?", (nim,)
         ).fetchone()
     return row is not None and row["face_encoding"] is not None
+
+@_timed_db_op
+def delete_face_encoding(nim: str) -> Dict[str, Any]:
+    """Menghapus face encoding mahasiswa dari database (reset)."""
+    if not verify_student(nim)["verified"]:
+        return {"success": False, "message": "NIM tidak ditemukan."}
+
+    with get_connection() as conn:
+        conn.execute("UPDATE mahasiswa SET face_encoding = NULL WHERE nim = ?", (nim,))
+
+    logger.info(f"🗑 Face encoding dihapus untuk {nim}")
+    return {"success": True, "message": f"Wajah untuk {nim} berhasil direset."}
+

@@ -1,25 +1,30 @@
-# 🎓 Smart-Lab SV IPB — KTM Scanner
+# 🎓 Smart-Lab SV IPB — AI Backend Scanner
 
-Sistem pemindaian **Kartu Tanda Mahasiswa (KTM)** secara real-time menggunakan Computer Vision + Face Verification untuk manajemen akses laboratorium.
+Sistem backend cerdas untuk pemindaian **Kartu Tanda Mahasiswa (KTM)** secara *real-time* menggunakan Computer Vision dan Verifikasi Wajah (Biometric) untuk otomatisasi akses laboratorium kampus.
 
-## ✨ Fitur
+Sistem ini didesain sebagai backend independen (`FastAPI`) yang dapat diintegrasikan dengan frontend web modern (React/Next.js/Vue) melalui antarmuka REST API dan WebSocket.
 
-- 🔍 **YOLO Detection** — Deteksi QR Code, NIM, Nama, dan Pas Foto pada KTM
-- 📝 **PaddleOCR v5** — Ekstraksi teks NIM dan Nama dari gambar
-- 📱 **QR Decode** — Baca NIM dari QR Code (pyzbar) dengan 4 strategi fallback
-- ✅ **Double Validation** — Cross-check NIM dari QR dan OCR
-- 👤 **Face Verification** — InsightFace ArcFace (99.83% akurasi LFW)
-- 🔐 **Face Enrollment** — Registrasi wajah pertama kali via webcam → 512-D embedding di DB
-- 🗄️ **Database** — Verifikasi identitas dan pencatatan check-in/check-out lab
-- 🌐 **REST + WebSocket API** — FastAPI backend untuk integrasi frontend
-- 🔒 **Privacy** — Hanya menyimpan 512 angka encoding, bukan foto wajah
+---
 
-## 🏗 Arsitektur
+## ✨ Fitur Utama
+
+- 🔍 **YOLO Object Detection** — Deteksi wilayah QR Code, NIM, Nama, dan Pas Foto pada KTM secara instan.
+- 📝 **OCR & QR Extraction** — Ekstraksi data NIM dan Nama menggunakan PaddleOCR v5 dan ekstraksi QR Code dengan algoritma multi-stage (pyzbar).
+- ✅ **Double Validation** — Sistem membandingkan NIM hasil bacaan OCR dengan NIM hasil bacaan QR Code untuk akurasi ekstra.
+- 👤 **Face Biometric Validation** — Pendaftaran (Enrollment) dan verifikasi wajah mahasiswa harian menggunakan InsightFace ArcFace (99.83% akurasi).
+- 🔐 **Privacy-First Design** — Sistem **tidak menyimpan** foto wajah mahasiswa di database, melainkan hanya menyimpan *512-D float32 mathematical embedding* (~2KB), yang membuat data biometrik mustahil direkonstruksi menjadi wajah asli.
+- 🌐 **REST + WebSocket API** — Menyediakan endpoint HTTP mutakhir untuk manajemen data dan koneksi WebSocket untuk *real-time continuous scanning*.
+
+---
+
+## 🏗 Arsitektur Machine Learning (ML Pipeline)
+
+Setiap frame gambar atau foto yang dikirimkan oleh Frontend diproses melalui 5 tahap pipelining berikut:
 
 ```
-Webcam Frame
-     │
-     ▼
+Frame HTTP/WS 
+      │
+      ▼
 ┌──────────┐    ┌──────────────┐    ┌───────────┐    ┌────────────┐
 │  YOLOv8  │───▶│  Preprocess  │───▶│ PaddleOCR │───▶│  Validator  │
 │  Detect  │    │  (OpenCV)    │    │ + pyzbar  │    │  (Regex)    │
@@ -38,221 +43,86 @@ Webcam Frame
                                                   └────────────────────┘
 ```
 
-### 🔄 Webcam Scanner — 6-Phase State Machine
+## 📋 Persyaratan Sistem
 
-```
-┌──────────┐   ┌───────────┐   ┌────────────┐   ┌──────────┐   ┌──────────┐
-│ SCANNING │──▶│ IDENTITAS │──▶│ REGISTRASI │──▶│ COMPLETE │──▶│ COOLDOWN │
-│          │   │ DITEMUKAN │   │   WAJAH    │   │          │   │          │
-│  YOLO +  │   │  (3 dtk)  │   │  (10 dtk)  │   │ (2 dtk)  │   │ (3 dtk)  │
-│   OCR    │   │  Info DB  │   │ Pertama 1x │   │ Berhasil │   │   Idle   │
-└──────────┘   └───────────┘   └────────────┘   └──────────┘   └──────────┘
-      ▲                              │                               │
-      │                   ┌──────────┘ (sudah terdaftar)             │
-      │                   ▼                                          │
-      │            ┌────────────┐                                    │
-      │            │ VERIFIKASI │                                    │
-      │            │   WAJAH    │─── gagal ──▶ COOLDOWN (DITOLAK)   │
-      │            │  (7 dtk)   │                                    │
-      │            └────────────┘                                    │
-      └──────────────────────────────────────────────────────────────┘
-```
+- **Python** 3.9, 3.10, 3.11, atau 3.12 (Tidak disarankan <= 3.8)
+- **Kamera** (Built-in / Eksternal USB) yang terhubung dengan akses internet Frontend.
+- Memori RAM minimal 2GB kosong untuk memuat model pendeteksi objek dan wajah.
+- OS yang didukung: Linux, macOS, dan Windows. (Linux/macOS lebih diprioritaskan untuk server deployment).
 
-**Flow pertama kali:** Scan KTM → DB match → **Registrasi Wajah** (kuning) → Check-in ✅
-**Flow selanjutnya:** Scan KTM → DB match → **Verifikasi Wajah** (biru) → Cocok → Check-in ✅
-**Wajah tidak cocok:** → ❌ **DITOLAK** → Cooldown (tidak ada check-in)
+## 🚀 Menjalankan Server Lokal (Quick Start)
 
-## 📋 Prerequisites
-
-- **Python** 3.9+
-- **Webcam** (built-in / USB)
-- **Model** `best.pt` — YOLOv8 yang sudah di-train (lihat [Training](#-training))
-- **OS**: macOS / Linux (belum ditest di Windows)
-
-## 🚀 Quick Start
+### 1. Kloning Repositori
 
 ```bash
-# 1. Clone repo
 git clone https://github.com/rhnzaldi/smartlab-scanner.git
 cd smartlab-scanner
+```
 
-# 2. Install dependencies
+### 2. Instalasi Variabel Lingkungan & Dependencies
+
+Disarankan menggunakan `Virtual Environment` seperti `venv` atau `conda`.
+
+```bash
 pip install -r requirements.txt
-
-# 3. Copy trained model
-cp /path/to/your/best.pt models/best.pt
-
-# 4. Seed database (opsional — edit daftar mahasiswa di file ini)
-python seed_mahasiswa.py
-
-# 5. Jalankan webcam scanner
-python test_webcam.py
-
-# 6. Atau jalankan API server
-python main.py
 ```
 
-### macOS — Jika ada error library:
+### 3. Masukkan Model Trained YOLO
+
+Pastikan Anda memiliki file model YOLOv8 kustom Anda (`best.pt`) dan masukkan ke dalam direktori `models/`:
 
 ```bash
-DYLD_LIBRARY_PATH=/opt/homebrew/lib python test_webcam.py
+mkdir -p models
+# Copy model YOLOv8 Anda yang telah di-train:
+# cp /jalur/ke/best.pt models/best.pt
 ```
 
-## 🎮 Webcam Controls
+### 4. Mulai Server API
 
-| Key | Fungsi |
-|-----|--------|
-| `q` | Quit |
-| `s` | Save frame ke `captures/` |
-| `SPACE` | Pause / Resume |
-| `+` / `-` | Adjust confidence threshold |
-| `o` | Force trigger OCR |
-| `c` | Manual check-out |
-| `r` | Reset semua peminjaman aktif |
-| `f` | **Reset face encoding** (test ulang enrollment) |
-
-### Opsi Command Line
+Jalankan FastAPI backend menggunakan server uvicorn:
 
 ```bash
-python test_webcam.py                  # Default (face verify ON)
-python test_webcam.py --no-face-verify # Tanpa face verification
-python test_webcam.py --camera 1       # Gunakan kamera kedua
-python test_webcam.py --confidence 0.5 # Threshold YOLO 50%
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## 👤 Face Enrollment & Verification
+Jika server sudah berjalan, buka **`http://localhost:8000/docs`** di browser komputer Anda untuk melihat **Swagger UI** interaktif yang menguraikan seluruh Endpoint HTTP backend. 
 
-### Cara Kerja
+*Catatan: Konfigurasi CORS hanya akan mengizinkan request API dari alamat Frontend spesifik seperti localhost:3000.*
 
-1. **Enrollment (pertama kali)**:
-   - Scan KTM → identitas ditemukan di DB
-   - Sistem mendeteksi belum ada encoding wajah → masuk mode **REGISTRASI**
-   - Hadap ke kamera → InsightFace menangkap wajah → 512-D embedding disimpan di DB
-   - Check-in berhasil ✅
+---
 
-2. **Verification (selanjutnya)**:
-   - Scan KTM → identitas ditemukan di DB
-   - Encoding wajah sudah ada → masuk mode **VERIFIKASI**
-   - Hadap ke kamera → InsightFace membandingkan wajah live vs encoding di DB
-   - Cocok (≥50%) → Check-in ✅ | Tidak cocok → ❌ DITOLAK
+## 📡 Daftar REST API (Endpoint)
 
-### Privacy & Security
+Integrasi Frontend dengan Server ini akan membutuhkan endpoint berikut:
 
-- **Hanya encoding yang disimpan** — 512 angka float32 (~2KB per mahasiswa)
-- **Bukan foto** — encoding tidak bisa di-reverse menjadi gambar wajah
-- **One-way** — aman dari pencurian data biometrik
+| Method | Endpoint | Deskripsi | Authentication |
+|--------|----------|-----------|----------------|
+| `GET` | `/health` | Memeriksa apakah Backend ML menyala | Terbuka |
+| `POST` | `/api/scan` | Upload base64/blob foto KTM untuk diperiksa AI | Terbuka |
+| `POST` | `/api/face/enroll` | Mendaftarkan pemetaan 512-D wajah baru (Awal Semester) | Terbuka |
+| `POST` | `/api/face/verify` | Memverifikasi identitas pengguna lab harian | Terbuka |
+| `POST` | `/api/checkout/{nim}` | Merekam waktu keluar mahasiswa (Check-out) | Terbuka |
+| `DELETE` | `/api/face/{nim}` | [ADMIN] Menghapus data biometrik wajah. | `X-Admin-Key` |
+| `GET` | `/api/status` | [ADMIN] Daftar mahasiswa yang hadir di lab. | `X-Admin-Key` |
 
-## 🗄️ Database
+> Panduan integrasi spesifik untuk tim pengembang web Frontend tersedia di file `/docs/FRONTEND_INTEGRATION.md`.
 
-Menggunakan **SQLite** (file: `smartlab.db`, auto-created).
+---
 
-### Tabel `mahasiswa`
-| Kolom | Tipe | Keterangan |
-|-------|------|------------|
-| `nim` | TEXT (PK) | NIM mahasiswa |
-| `nama` | TEXT | Nama lengkap |
-| `prodi` | TEXT | Program studi |
-| `angkatan` | INTEGER | Tahun masuk |
-| `status` | TEXT | `aktif` / `nonaktif` |
-| `face_encoding` | BLOB | 512-D face embedding (float32) |
+## 🛠️ Tech Stack & Model Library
 
-### Tabel `peminjaman`
-| Kolom | Tipe | Keterangan |
-|-------|------|------------|
-| `id` | INTEGER (PK) | Auto increment |
-| `nim` | TEXT (FK) | Referensi ke mahasiswa |
-| `lab` | TEXT | Nama lab |
-| `waktu_masuk` | TIMESTAMP | Waktu check-in |
-| `waktu_keluar` | TIMESTAMP | Waktu check-out |
-| `status` | TEXT | `aktif` / `selesai` |
-
-### Menambah Data Mahasiswa
-
-Edit file `seed_mahasiswa.py`:
-
-```python
-MAHASISWA = [
-    ("J04032310XX", "Nama Mahasiswa", "Prodi", 2023),
-    # Tambahkan baris baru di sini
-]
-```
-
-Lalu jalankan:
-
-```bash
-python seed_mahasiswa.py
-```
-
-## 🤖 Training
-
-Model YOLOv8 di-train menggunakan Google Colab. Lihat `train_colab.py` untuk panduan lengkap.
-
-### Dataset
-- **Objek**: `qr_code`, `text_nim`, `text_nama`, `face_photo`
-- **Augmentasi**: `augment_dataset.py` — rotasi, blur, brightness, noise
-- **Platform**: Roboflow untuk labeling + export
-
-### Langkah Training
-1. Upload dataset ke Roboflow
-2. Buka Google Colab
-3. Jalankan cell-cell di `train_colab.py` (CELL 1 - CELL 7)
-4. Download `best.pt` ke `models/best.pt`
-
-### Evaluasi Model
-```bash
-# Jalankan lokal — benchmark semua model ML
-python evaluate_models.py
-```
-
-Di Google Colab (untuk YOLO metrics):
-- **CELL 5**: Precision, Recall, F1 Score, mAP@50, mAP@50-95 (per-class)
-- **CELL 5B**: Confusion matrix + training curves + download ZIP
-- **CELL 5C**: Tabel Markdown siap copy-paste ke laporan
-
-## 📁 Struktur Proyek
-
-```
-smartlab-scanner/
-├── ml/                        # ML Pipeline
-│   ├── pipeline.py            # Orchestrator: detect → crop → extract → validate
-│   ├── preprocessor.py        # OpenCV preprocessing (grayscale, blur, sharpen)
-│   ├── extractor.py           # PaddleOCR + pyzbar extraction
-│   ├── validator.py           # Regex cleaning & NIM double-validation
-│   └── face_verify.py         # InsightFace ArcFace face enrollment & verification
-├── db/
-│   └── database.py            # SQLite: mahasiswa + peminjaman + face encoding
-├── models/
-│   └── best.pt                # YOLOv8 model weights (git-ignored)
-├── main.py                    # FastAPI REST + WebSocket server
-├── test_webcam.py             # Standalone webcam scanner (6-phase UX)
-├── evaluate_models.py         # Benchmark semua model ML (untuk laporan)
-├── seed_mahasiswa.py          # Script untuk seed data mahasiswa
-├── train_colab.py             # Panduan training + evaluasi di Google Colab
-├── augment_dataset.py         # Data augmentation script
-├── requirements.txt           # Python dependencies
-└── .gitignore
-```
-
-## 📊 Tech Stack
-
-| Komponen | Teknologi | Detail |
+| Komponen | Teknologi Implementasi | Spesifikasi / Ukuran |
 |----------|-----------|--------|
-| Object Detection | YOLOv8n (Ultralytics) | 6MB, 4 kelas, ~48ms/frame |
-| OCR | PaddleOCR v5 | English mode, ~500ms/image |
-| QR Decode | pyzbar | 4 strategi fallback |
-| Face Recognition | InsightFace ArcFace (buffalo_l) | 512-D, 99.83% LFW, ~110ms/frame |
-| Backend | FastAPI + Uvicorn | REST + WebSocket |
-| Database | SQLite (WAL mode) | Auto-created, zero config |
-| Image Processing | OpenCV + NumPy | Preprocessing pipeline |
-| ML Runtime | ONNX Runtime | CPU optimized |
+| Object Detection | **YOLOv8n** (Ultralytics) | 6MB, 4 label kelas, ~48ms inference per frame |
+| Ekstraksi OCR Teks | **PaddleOCR v5** | ~500ms/image (Deteksi Model Bahasa Inggris/Alfabet) |
+| Decoder QR Code | **pyzbar** | Dengan OpenCV 4 fallback filter strategy. |
+| Pengenalan Wajah AI | **InsightFace ArcFace** | `buffalo_l`, 512-Dimensi, ONNX Runtime (~110ms /frame) |
+| Web Backend | **FastAPI** + **Uvicorn** | Python asinkron, ASGI |
+| Manajemen Database | **SQLite** (lokal) | Native, file DB auto-generated (`smartlab.db`) |
+| Pengolahan Gambar Matrix | **OpenCV** + **NumPy** | Grayscale, blur, ROI cropping, adaptive array |
 
-## ⚙️ Environment Variables
+---
 
-| Variable | Default | Keterangan |
-|----------|---------|------------|
-| `CORS_ORIGINS` | `http://localhost:3000,...` | Allowed CORS origins (comma-separated) |
-| `DYLD_LIBRARY_PATH` | — | macOS: set ke `/opt/homebrew/lib` jika perlu |
+## 📄 Lisensi
 
-## 📄 License
 
-MIT
