@@ -59,15 +59,31 @@ git clone https://github.com/rhnzaldi/smartlab-scanner.git
 cd smartlab-scanner
 ```
 
-### 2. Instalasi Variabel Lingkungan & Dependencies
+### 2. Buat Virtual Environment (Sangat Disarankan)
 
-Disarankan menggunakan `Virtual Environment` seperti `venv` atau `conda`.
+Agar tidak bentrok dengan library proyek lain, gunakan Virtual Environment.
+
+**Untuk Windows:**
+```bash
+python -m venv venv
+.\venv\Scripts\activate
+```
+
+**Untuk macOS / Linux:**
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 3. Instalasi Dependencies
+
+Pastikan tulisan `(venv)` sudah muncul di terminal Anda, lalu jalankan:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Masukkan Model Trained YOLO
+### 4. Masukkan Model Trained YOLO
 
 Pastikan Anda memiliki file model YOLOv8 kustom Anda (`best.pt`) dan masukkan ke dalam direktori `models/`:
 
@@ -77,7 +93,7 @@ mkdir -p models
 # cp /jalur/ke/best.pt models/best.pt
 ```
 
-### 4. Mulai Server API
+### 5. Mulai Server API
 
 Jalankan FastAPI backend menggunakan server uvicorn:
 

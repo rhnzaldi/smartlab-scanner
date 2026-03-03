@@ -11,10 +11,17 @@
 git clone https://github.com/rhnzaldi/smartlab-scanner.git
 cd smartlab-scanner
 
-# Install dependencies
+# Install dependencies menggunakan Virtual Environment
+# Windows:
+python -m venv venv
+.\venv\Scripts\activate
+# macOS/Linux:
+# python3 -m venv venv && source venv/bin/activate
+
 pip install -r requirements.txt
 
 # Jalankan server (port 8000)
+# Pastikan terminal masih berada dalam state (venv)
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
