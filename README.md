@@ -85,16 +85,26 @@ pip install -r requirements.txt
 
 **Opsional — Akselerasi GPU (Hanya Windows/Linux dengan NVIDIA GPU):**
 
-Jika laptop/PC Anda memiliki kartu grafis NVIDIA (GeForce GTX/RTX), Anda bisa mempercepat model InsightFace dan YOLO hingga **3-5x lebih cepat** dengan menginstal dukungan GPU:
+Jika laptop/PC Anda memiliki kartu grafis NVIDIA (GeForce GTX/RTX), Anda bisa mempercepat model InsightFace dan YOLO hingga **3-5x lebih cepat**. Ada dua cara:
+
+**Cara 1 (Disarankan): Gunakan branch `windows-gpu`**
+
+Branch ini sudah mengubah semua konfigurasi ke mode GPU secara otomatis (`onnxruntime-gpu`, `paddlepaddle-gpu`, CUDA provider di InsightFace dan PaddleOCR):
+
+```bash
+git checkout windows-gpu
+pip install -r requirements.txt
+```
+
+**Cara 2 (Manual): Tetap di branch `main`, ganti library satu per satu**
 
 ```bash
 # Pastikan sudah install CUDA Toolkit 11.8 atau 12.x dari https://developer.nvidia.com/cuda-downloads
-# Lalu ganti onnxruntime CPU dengan versi GPU:
 pip uninstall onnxruntime -y
 pip install onnxruntime-gpu
 ```
 
-> Jika tidak memiliki NVIDIA GPU, **tidak perlu melakukan langkah ini**. Sistem akan berjalan normal menggunakan CPU.
+> Jika tidak memiliki NVIDIA GPU, **tetap di branch `main`** dan tidak perlu melakukan langkah ini. Sistem akan berjalan normal menggunakan CPU.
 
 **Khusus Windows — Fix pyzbar (QR Code reader):**
 
