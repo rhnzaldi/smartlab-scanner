@@ -29,7 +29,7 @@
              │
      ┌───────▼───────┐
      │ db/database   │
-     │ (SQLite)      │
+     │  (MySQL)      │
      └───────────────┘
 ```
 
@@ -220,7 +220,7 @@ Membandingkan NIM dari QR code dengan NIM dari OCR teks:
 
 ## 7. Database (`db/database.py`)
 
-### Engine: SQLite (`smartlab.db`)
+### Engine: MySQL (`smartlab_db` @ localhost)
 
 ### Tabel: `mahasiswa`
 
@@ -231,13 +231,13 @@ Membandingkan NIM dari QR code dengan NIM dari OCR teks:
 | `prodi` | TEXT | Program studi |
 | `angkatan` | INTEGER | Tahun masuk |
 | `status` | TEXT | Status mahasiswa |
-| `face_encoding` | BLOB | 512-D float32 (2048 bytes) |
+| `face_encoding` | LONGBLOB | 512-D float32 (2048 bytes) |
 
 ### Tabel: `peminjaman`
 
 | Kolom | Tipe | Keterangan |
 |-------|------|------------|
-| `id` | INTEGER PRIMARY KEY | Auto-increment |
+| `id` | INT AUTO_INCREMENT PRIMARY KEY | Auto-increment |
 | `nim` | TEXT | FK → mahasiswa |
 | `lab` | TEXT | Nama lab |
 | `waktu_masuk` | TEXT | Timestamp check-in |
@@ -289,7 +289,7 @@ Membandingkan NIM dari QR code dengan NIM dari OCR teks:
 | Variable | Default | Keterangan |
 |----------|---------|------------|
 | `CORS_ORIGINS` | `localhost:3000,5173` | Daftar origin yang diizinkan |
-| `ADMIN_API_KEY` | `smartlab-admin-2025` | API key untuk endpoint admin |
+| `ADMIN_API_KEY` | `CHANGE-ME-IN-PRODUCTION` | API key untuk endpoint admin |
 
 ---
 
@@ -315,7 +315,7 @@ ScanKtm/
 │   └── validator.py        # Regex cleaning + NIM double-validation
 ├── db/
 │   ├── __init__.py
-│   └── database.py         # SQLite CRUD + face encoding storage
+│   └── database.py         # MySQL (PyMySQL) CRUD + face encoding storage
 └── docs/
     ├── FRONTEND_INTEGRATION.md  # Panduan integrasi untuk tim Frontend
     └── TECHNICAL.md             # Dokumen ini

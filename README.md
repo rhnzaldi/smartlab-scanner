@@ -29,7 +29,7 @@ Frame HTTP/WS
 └──────────┘    └──────────────┘    └───────────┘    └─────┬──────┘
    4 class:        grayscale          NIM text              │
    qr_code         blur              Nama text        ┌────▼──────┐
-   text_nim         sharpen           QR data          │  SQLite   │
+   text_nim         sharpen           QR data          │   MySQL   │
    text_nama        threshold                          │ Verify +  │
    face_photo                                          │ Check-in  │
                                                        └────┬──────┘
@@ -192,7 +192,7 @@ Integrasi Frontend dengan Server ini akan membutuhkan endpoint berikut:
 | Decoder QR Code | **pyzbar** | Dengan OpenCV 4 fallback filter strategy. |
 | Pengenalan Wajah AI | **InsightFace ArcFace** | `buffalo_l`, 512-Dimensi, ONNX Runtime (~110ms /frame) |
 | Web Backend | **FastAPI** + **Uvicorn** | Python asinkron, ASGI |
-| Manajemen Database | **SQLite** (lokal) | Native, file DB auto-generated (`smartlab.db`) |
+| Manajemen Database | **MySQL** (PyMySQL) | Serverless-ready, koneksi via `.env`, `InnoDB` + `utf8mb4` |
 | Pengolahan Gambar Matrix | **OpenCV** + **NumPy** | Grayscale, blur, ROI cropping, adaptive array |
 
 ---
