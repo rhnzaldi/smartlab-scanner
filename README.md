@@ -1,8 +1,6 @@
 # 🎓 Smart-Lab SV IPB — AI Backend Scanner
 
-Sistem backend cerdas untuk pemindaian **Kartu Tanda Mahasiswa (KTM)** secara *real-time* menggunakan Computer Vision dan Verifikasi Wajah (Biometric) untuk otomatisasi akses laboratorium kampus.
-
-Sistem ini didesain sebagai backend independen (`FastAPI`) yang dapat diintegrasikan dengan frontend web modern (React/Next.js/Vue) melalui antarmuka REST API dan WebSocket.
+Sistem backend cerdas untuk pemindaian **Kartu Tanda Mahasiswa (KTM)** secara *real-time* menggunakan Computer Vision dan Verifikasi Wajah untuk otomatisasi akses laboratorium kampus.
 
 ---
 
@@ -85,7 +83,7 @@ pip install -r requirements.txt
 
 **Opsional — Akselerasi GPU (Hanya Windows/Linux dengan NVIDIA GPU):**
 
-Jika laptop/PC Anda memiliki kartu grafis NVIDIA (GeForce GTX/RTX), Anda bisa mempercepat model InsightFace dan YOLO hingga **3-5x lebih cepat**. Ada dua cara:
+Ada dua cara:
 
 **Cara 1 (Disarankan): Gunakan branch `windows-gpu`**
 
@@ -150,7 +148,7 @@ Jalankan FastAPI backend menggunakan server uvicorn:
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Jika server sudah berjalan, buka **`http://localhost:8000/docs`** di browser komputer Anda untuk melihat **Swagger UI** interaktif yang menguraikan seluruh Endpoint HTTP backend. 
+Jika server sudah berjalan, buka **`http://localhost:8000/docs`** 
 
 *Catatan: Konfigurasi CORS hanya akan mengizinkan request API dari alamat Frontend spesifik seperti localhost:3000.*
 
@@ -200,6 +198,4 @@ Integrasi Frontend dengan Server ini akan membutuhkan endpoint berikut:
 | InsightFace download lambat | Model `buffalo_l` (~300MB) di-download otomatis saat pertama kali. Tunggu selesai |
 
 ---
-
-## 📄 Lisensi
 
