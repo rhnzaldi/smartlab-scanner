@@ -83,17 +83,56 @@ Pastikan tulisan `(venv)` sudah muncul di terminal Anda, lalu jalankan:
 pip install -r requirements.txt
 ```
 
+**Opsional — Akselerasi GPU (Hanya Windows/Linux dengan NVIDIA GPU):**
+
+Jika laptop/PC Anda memiliki kartu grafis NVIDIA (GeForce GTX/RTX), Anda bisa mempercepat model InsightFace dan YOLO hingga **3-5x lebih cepat** dengan menginstal dukungan GPU:
+
+```bash
+# Pastikan sudah install CUDA Toolkit 11.8 atau 12.x dari https://developer.nvidia.com/cuda-downloads
+# Lalu ganti onnxruntime CPU dengan versi GPU:
+pip uninstall onnxruntime -y
+pip install onnxruntime-gpu
+```
+
+> Jika tidak memiliki NVIDIA GPU, **tidak perlu melakukan langkah ini**. Sistem akan berjalan normal menggunakan CPU.
+
+**Khusus Windows — Fix pyzbar (QR Code reader):**
+
+Jika muncul error `FileNotFoundError: Could not find module 'libzbar-64.dll'`, install Visual C++ Redistributable:
+
+```bash
+# Opsi 1: Install via pip
+pip install pyzbar[scripts]
+
+# Opsi 2: Download Visual C++ Redistributable dari Microsoft
+# https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
+```
+
 ### 4. Masukkan Model Trained YOLO
 
 Pastikan Anda memiliki file model YOLOv8 kustom Anda (`best.pt`) dan masukkan ke dalam direktori `models/`:
 
 ```bash
+# Windows:
+mkdir models
+copy \jalur\ke\best.pt models\best.pt
+
+# macOS/Linux:
 mkdir -p models
-# Copy model YOLOv8 Anda yang telah di-train:
-# cp /jalur/ke/best.pt models/best.pt
+cp /jalur/ke/best.pt models/best.pt
 ```
 
-### 5. Mulai Server API
+### 5. Isi Data Mahasiswa Awal
+
+Edit file `seed_mahasiswa.py` untuk memasukkan daftar NIM dan nama mahasiswa, lalu jalankan:
+
+```bash
+python seed_mahasiswa.py
+```
+
+> Langkah ini hanya perlu dilakukan **sekali** saat pertama kali setup. Database `smartlab.db` akan dibuat otomatis.
+
+### 6. Mulai Server API
 
 Jalankan FastAPI backend menggunakan server uvicorn:
 
@@ -139,6 +178,18 @@ Integrasi Frontend dengan Server ini akan membutuhkan endpoint berikut:
 
 ---
 
-## 📄 Lisensi
+## ❓ Troubleshooting
 
+| Masalah | Solusi |
+|---------|--------|
+| `ModuleNotFoundError: No module named 'paddleocr'` | Pastikan sudah `pip install -r requirements.txt` di dalam venv |
+| `libzbar-64.dll not found` (Windows) | Install Visual C++ Redistributable atau `pip install pyzbar[scripts]` |
+| `CUDA out of memory` | Kurangi `det_size` di `face_verify.py` dari `(640,640)` ke `(320,320)` |
+| Server port 8000 sudah dipakai | Jalankan di port lain: `uvicorn main:app --port 8001` |
+| Model YOLO tidak ditemukan | Pastikan file `best.pt` ada di folder `models/` |
+| InsightFace download lambat | Model `buffalo_l` (~300MB) di-download otomatis saat pertama kali. Tunggu selesai |
+
+---
+
+## 📄 Lisensi
 
