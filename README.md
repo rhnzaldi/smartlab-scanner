@@ -9,9 +9,9 @@ Sistem backend cerdas untuk pemindaian **Kartu Tanda Mahasiswa (KTM)** secara *r
 - 🔍 **YOLO Object Detection** — Deteksi wilayah QR Code, NIM, Nama, dan Pas Foto pada KTM secara instan.
 - 📝 **OCR & QR Extraction** — Ekstraksi data NIM dan Nama menggunakan PaddleOCR v5 dan ekstraksi QR Code dengan algoritma multi-stage (pyzbar).
 - ✅ **Double Validation** — Sistem membandingkan NIM hasil bacaan OCR dengan NIM hasil bacaan QR Code untuk akurasi ekstra.
-- 👤 **Face Biometric Validation** — Pendaftaran (Enrollment) dan verifikasi wajah mahasiswa harian menggunakan InsightFace ArcFace (99.83% akurasi).
-- 🔐 **Privacy-First Design** — Sistem **tidak menyimpan** foto wajah mahasiswa di database, melainkan hanya menyimpan *512-D float32 mathematical embedding* (~2KB), yang membuat data biometrik mustahil direkonstruksi menjadi wajah asli.
-- 🌐 **REST + WebSocket API** — Menyediakan endpoint HTTP mutakhir untuk manajemen data dan koneksi WebSocket untuk *real-time continuous scanning*.
+- 👤 **Face Biometric Validation** — Pendaftaran (Enrollment) dan verifikasi wajah mahasiswa harian menggunakan InsightFace ArcFace .
+- 🔐 **Privacy-First Design** — Sistem **tidak menyimpan** foto wajah mahasiswa di database, melainkan hanya menyimpan *512-D float32 mathematical embedding* (~2KB), .
+- 🌐 **REST + WebSocket API** — Menyediakan endpoint mutakhir untuk manajemen data dan koneksi WebSocket untuk *real-time continuous scanning*.
 
 ---
 
@@ -149,8 +149,6 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Jika server sudah berjalan, buka **`http://localhost:8000/docs`** 
-
-*Catatan: Konfigurasi CORS hanya akan mengizinkan request API dari alamat Frontend spesifik seperti localhost:3000.*
 
 ---
 
