@@ -28,6 +28,10 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
 
+# Load .env file sebelum import db/ (agar DB_HOST, DB_USER, dll tersedia)
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic import BaseModel
 
 import cv2

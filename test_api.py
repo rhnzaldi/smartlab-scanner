@@ -39,7 +39,8 @@ def setup_teardown():
     
     # Hapus test face encoding jika ada
     with get_connection() as conn:
-        conn.execute("UPDATE mahasiswa SET face_encoding = NULL WHERE nim = ?", (TEST_NIM,))
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE mahasiswa SET face_encoding = NULL WHERE nim = %s", (TEST_NIM,))
         
     yield
     
@@ -126,7 +127,9 @@ def test_api_face_reset():
     assert res.status_code == 200
 
     with get_connection() as conn:
-        row = conn.execute("SELECT face_encoding FROM mahasiswa WHERE nim = ?", (TEST_NIM,)).fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT face_encoding FROM mahasiswa WHERE nim = %s", (TEST_NIM,))
+            row = cursor.fetchone()
         assert row["face_encoding"] is None
 
 

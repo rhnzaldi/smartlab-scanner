@@ -79,6 +79,19 @@ Pastikan tulisan `(venv)` sudah muncul di terminal Anda, lalu jalankan:
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env
+```
+
+### 4. Setup Database MySQL
+
+Proyek ini telah bermigrasi dari SQLite ke MySQL. Anda membutuhkan server MySQL lokal (contoh: **DBngin** atau XAMPP).
+
+1. Pastikan server MySQL berjalan.
+2. Buat database baru bernama `smartlab_db`.
+3. Jalankan skrip *seed* untuk membuat tabel dan data uji:
+
+```bash
+python seed_mahasiswa.py
 ```
 
 **Opsional — Akselerasi GPU (Hanya Windows/Linux dengan NVIDIA GPU):**

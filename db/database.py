@@ -1,8 +1,8 @@
 """
-Smart-Lab SV IPB — Database Module
-SQLite database untuk manajemen mahasiswa dan peminjaman lab.
+Smart-Lab SV IPB — Database Module (MySQL)
+MySQL database untuk manajemen mahasiswa dan peminjaman lab.
 
-NFR Refactored:
+Migrated from SQLite to MySQL (PyMySQL driver).
 - [R1] Context manager untuk semua koneksi (no connection leak)
 - [R2] Duration fix: total_seconds() bukan .seconds
 - [M1] Named constants (no magic numbers)
@@ -10,7 +10,8 @@ NFR Refactored:
 - [O2] DB operation timing via decorator
 """
 
-import sqlite3
+import pymysql
+from pymysql.cursors import DictCursor
 import logging
 import os
 import functools
@@ -25,9 +26,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────
-# Constants (menggantikan magic numbers) [M1]
+# Constants [M1]
 # ────────────────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "smartlab.db")
+DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_USER = os.environ.get("DB_USER", "root")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+DB_NAME = os.environ.get("DB_NAME", "smartlab_db")
+
 NAME_MATCH_THRESHOLD = 0.5       # minimum similarity untuk fuzzy name match
 NIM_PATTERN = r"^J[A-Z0-9]{6,12}$"  # valid NIM format untuk input validation [S2]
 DEFAULT_LAB = "Lab Smart-Lab"
@@ -40,17 +46,24 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 @contextmanager
 def get_connection():
     """
-    Context manager untuk SQLite connection.
+    Context manager untuk MySQL connection via PyMySQL.
     Otomatis commit saat sukses, rollback saat error, selalu close.
 
     Usage:
         with get_connection() as conn:
-            conn.execute("SELECT ...")
+            with conn.cursor() as cur:
+                cur.execute("SELECT ...")
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")  # enforce FK constraints
+    conn = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        cursorclass=DictCursor,
+        charset="utf8mb4",
+        autocommit=False,
+    )
     try:
         yield conn
         conn.commit()
@@ -82,62 +95,60 @@ def _timed_db_op(func):
 def init_db():
     """Create tables if not exist and seed initial data."""
     with get_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS mahasiswa (
-                nim TEXT PRIMARY KEY,
-                nama TEXT NOT NULL,
-                prodi TEXT,
-                angkatan INTEGER,
-                status TEXT DEFAULT 'aktif',
-                face_encoding BLOB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Migration: add face_encoding column if table already exists without it
-        try:
-            cursor.execute("ALTER TABLE mahasiswa ADD COLUMN face_encoding BLOB")
-            logger.info("✅ Added face_encoding column to mahasiswa")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS peminjaman (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nim TEXT NOT NULL REFERENCES mahasiswa(nim),
-                lab TEXT NOT NULL DEFAULT 'Lab Smart-Lab',
-                waktu_masuk TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                waktu_keluar TIMESTAMP,
-                status TEXT DEFAULT 'aktif',
-                scan_confidence REAL,
-                catatan TEXT
-            )
-        """)
-
-        # Index untuk query yang sering dipakai [P1]
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_peminjaman_nim_status
-            ON peminjaman(nim, status)
-        """)
-
-        # Seed data
-        cursor.execute("SELECT COUNT(*) FROM mahasiswa")
-        if cursor.fetchone()[0] == 0:
+        with conn.cursor() as cursor:
+            # Tabel mahasiswa
             cursor.execute("""
-                INSERT INTO mahasiswa (nim, nama, prodi, angkatan, status)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                "J0403231061",
-                "Muhammad Raihan Zaldiputra",
-                "TPL",
-                2023,
-                "aktif",
-            ))
-            logger.info("✅ Seed data: Muhammad Raihan Zaldiputra (J0403231061)")
+                CREATE TABLE IF NOT EXISTS mahasiswa (
+                    nim VARCHAR(20) PRIMARY KEY,
+                    nama VARCHAR(100) NOT NULL,
+                    prodi VARCHAR(50),
+                    angkatan INT,
+                    status VARCHAR(20) DEFAULT 'aktif',
+                    face_encoding LONGBLOB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
 
-    logger.info(f"✅ Database ready: {DB_PATH}")
+            # Tabel peminjaman
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS peminjaman (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    nim VARCHAR(20) NOT NULL,
+                    lab VARCHAR(100) NOT NULL DEFAULT 'Lab Smart-Lab',
+                    waktu_masuk TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    waktu_keluar TIMESTAMP NULL,
+                    status VARCHAR(20) DEFAULT 'aktif',
+                    scan_confidence FLOAT,
+                    catatan TEXT,
+                    FOREIGN KEY (nim) REFERENCES mahasiswa(nim)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # Index untuk query yang sering dipakai [P1]
+            try:
+                cursor.execute("""
+                    CREATE INDEX idx_peminjaman_nim_status
+                    ON peminjaman(nim, status)
+                """)
+            except pymysql.err.OperationalError:
+                pass  # index already exists
+
+            # Seed data
+            cursor.execute("SELECT COUNT(*) AS cnt FROM mahasiswa")
+            if cursor.fetchone()["cnt"] == 0:
+                cursor.execute("""
+                    INSERT INTO mahasiswa (nim, nama, prodi, angkatan, status)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    "J0403231061",
+                    "Muhammad Raihan Zaldiputra",
+                    "TPL",
+                    2023,
+                    "aktif",
+                ))
+                logger.info("✅ Seed data: Muhammad Raihan Zaldiputra (J0403231061)")
+
+    logger.info(f"✅ Database ready: {DB_NAME}@{DB_HOST}:{DB_PORT}")
 
 
 # ────────────────────────────────────────────────────────
@@ -147,10 +158,9 @@ def init_db():
 def lookup_mahasiswa(nim: str) -> Optional[Dict]:
     """Cari mahasiswa berdasarkan NIM. Returns dict atau None."""
     with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM mahasiswa WHERE nim = ?", (nim,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM mahasiswa WHERE nim = %s", (nim,))
+            return cursor.fetchone()
 
 
 def fuzzy_name_match(ocr_name: str, db_name: str) -> float:
@@ -174,7 +184,7 @@ def verify_student(nim: str, ocr_name: Optional[str] = None) -> Dict:
 
     Returns:
         {
-            "success": bool,      # [M7] konsisten dengan fungsi lain
+            "success": bool,
             "verified": bool,
             "nim": str,
             "nama_db": str | None,
@@ -261,29 +271,28 @@ def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
     [R1] Context manager untuk auto-close connection.
     """
     with get_connection() as conn:
-        cursor = conn.cursor()
+        with conn.cursor() as cursor:
+            # Cek peminjaman aktif
+            cursor.execute(
+                "SELECT id, waktu_masuk FROM peminjaman WHERE nim = %s AND status = 'aktif'",
+                (nim,)
+            )
+            active = cursor.fetchone()
 
-        # Cek peminjaman aktif
-        cursor.execute(
-            "SELECT id, waktu_masuk FROM peminjaman WHERE nim = ? AND status = 'aktif'",
-            (nim,)
-        )
-        active = cursor.fetchone()
+            if active:
+                return {
+                    "success": False,
+                    "message": f"⚠️ {nim} sudah check-in sejak {active['waktu_masuk']}",
+                    "peminjaman_id": active["id"],
+                }
 
-        if active:
-            return {
-                "success": False,
-                "message": f"⚠️ {nim} sudah check-in sejak {active['waktu_masuk']}",
-                "peminjaman_id": active["id"],
-            }
-
-        # Insert peminjaman baru
-        now = datetime.now().strftime(TIMESTAMP_FORMAT)
-        cursor.execute(
-            "INSERT INTO peminjaman (nim, lab, waktu_masuk, status) VALUES (?, ?, ?, 'aktif')",
-            (nim, lab, now)
-        )
-        pid = cursor.lastrowid
+            # Insert peminjaman baru
+            now = datetime.now().strftime(TIMESTAMP_FORMAT)
+            cursor.execute(
+                "INSERT INTO peminjaman (nim, lab, waktu_masuk, status) VALUES (%s, %s, %s, 'aktif')",
+                (nim, lab, now)
+            )
+            pid = cursor.lastrowid
 
     logger.info(f"📥 Check-in: {nim} → {lab} (ID: {pid})")
     return {
@@ -301,27 +310,34 @@ def check_out(nim: str) -> Dict:
     [R2] Duration fix: total_seconds().
     """
     with get_connection() as conn:
-        cursor = conn.cursor()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, lab, waktu_masuk FROM peminjaman WHERE nim = %s AND status = 'aktif'",
+                (nim,)
+            )
+            active = cursor.fetchone()
 
-        cursor.execute(
-            "SELECT id, lab, waktu_masuk FROM peminjaman WHERE nim = ? AND status = 'aktif'",
-            (nim,)
-        )
-        active = cursor.fetchone()
+            if not active:
+                return {
+                    "success": False,
+                    "message": f"⚠️ {nim} tidak memiliki peminjaman aktif",
+                }
 
-        if not active:
-            return {
-                "success": False,
-                "message": f"⚠️ {nim} tidak memiliki peminjaman aktif",
-            }
+            now = datetime.now().strftime(TIMESTAMP_FORMAT)
 
-        now = datetime.now().strftime(TIMESTAMP_FORMAT)
-        cursor.execute(
-            "UPDATE peminjaman SET waktu_keluar = ?, status = 'selesai' WHERE id = ?",
-            (now, active["id"])
-        )
+            # Handle waktu_masuk yang bisa datetime object atau string
+            waktu_masuk = active["waktu_masuk"]
+            if isinstance(waktu_masuk, datetime):
+                waktu_masuk_str = waktu_masuk.strftime(TIMESTAMP_FORMAT)
+            else:
+                waktu_masuk_str = str(waktu_masuk)
 
-    durasi = _format_duration(active["waktu_masuk"], now)
+            cursor.execute(
+                "UPDATE peminjaman SET waktu_keluar = %s, status = 'selesai' WHERE id = %s",
+                (now, active["id"])
+            )
+
+    durasi = _format_duration(waktu_masuk_str, now)
     logger.info(f"📤 Check-out: {nim} (durasi: {durasi})")
     return {
         "success": True,
@@ -335,27 +351,27 @@ def check_out(nim: str) -> Dict:
 def get_active_peminjaman() -> List[Dict]:
     """List semua peminjaman aktif."""
     with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT p.*, m.nama
-            FROM peminjaman p
-            JOIN mahasiswa m ON p.nim = m.nim
-            WHERE p.status = 'aktif'
-            ORDER BY p.waktu_masuk DESC
-        """)
-        return [dict(r) for r in cursor.fetchall()]
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT p.*, m.nama
+                FROM peminjaman p
+                JOIN mahasiswa m ON p.nim = m.nim
+                WHERE p.status = 'aktif'
+                ORDER BY p.waktu_masuk DESC
+            """)
+            return cursor.fetchall()
 
 
 @_timed_db_op
 def reset_all_peminjaman() -> Dict:
     """Reset semua peminjaman aktif → selesai. Untuk testing."""
     with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE peminjaman SET status = 'selesai', waktu_keluar = ? WHERE status = 'aktif'",
-            (datetime.now().strftime(TIMESTAMP_FORMAT),)
-        )
-        count = cursor.rowcount
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE peminjaman SET status = 'selesai', waktu_keluar = %s WHERE status = 'aktif'",
+                (datetime.now().strftime(TIMESTAMP_FORMAT),)
+            )
+            count = cursor.rowcount
 
     logger.info(f"🔄 Reset: {count} peminjaman aktif → selesai")
     return {"success": True, "message": f"🔄 Reset {count} peminjaman aktif", "count": count}
@@ -368,15 +384,16 @@ def reset_all_peminjaman() -> Dict:
 def save_face_encoding(nim: str, encoding: np.ndarray) -> Dict:
     """
     Simpan face encoding (512-D numpy array) ke database.
-    Encoding disimpan sebagai BLOB (raw bytes, ~2KB).
+    Encoding disimpan sebagai LONGBLOB (raw bytes, ~2KB).
     TIDAK menyimpan foto — hanya angka encoding.
     """
     with get_connection() as conn:
         encoding_bytes = encoding.astype(np.float32).tobytes()
-        conn.execute(
-            "UPDATE mahasiswa SET face_encoding = ? WHERE nim = ?",
-            (encoding_bytes, nim)
-        )
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE mahasiswa SET face_encoding = %s WHERE nim = %s",
+                (encoding_bytes, nim)
+            )
 
     logger.info(f"✅ Face encoding saved for {nim} ({len(encoding_bytes)} bytes)")
     return {"success": True, "message": f"✅ Wajah terdaftar untuk {nim}"}
@@ -389,9 +406,11 @@ def load_face_encoding(nim: str) -> Optional[np.ndarray]:
     Returns 512-D numpy array (float32) atau None jika belum ada.
     """
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT face_encoding FROM mahasiswa WHERE nim = ?", (nim,)
-        ).fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT face_encoding FROM mahasiswa WHERE nim = %s", (nim,)
+            )
+            row = cursor.fetchone()
 
     if row and row["face_encoding"]:
         encoding = np.frombuffer(row["face_encoding"], dtype=np.float32)
@@ -405,10 +424,13 @@ def load_face_encoding(nim: str) -> Optional[np.ndarray]:
 def has_face_encoding(nim: str) -> bool:
     """Check apakah mahasiswa sudah punya face encoding."""
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT face_encoding FROM mahasiswa WHERE nim = ?", (nim,)
-        ).fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT face_encoding FROM mahasiswa WHERE nim = %s", (nim,)
+            )
+            row = cursor.fetchone()
     return row is not None and row["face_encoding"] is not None
+
 
 @_timed_db_op
 def delete_face_encoding(nim: str) -> Dict[str, Any]:
@@ -417,8 +439,8 @@ def delete_face_encoding(nim: str) -> Dict[str, Any]:
         return {"success": False, "message": "NIM tidak ditemukan."}
 
     with get_connection() as conn:
-        conn.execute("UPDATE mahasiswa SET face_encoding = NULL WHERE nim = ?", (nim,))
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE mahasiswa SET face_encoding = NULL WHERE nim = %s", (nim,))
 
     logger.info(f"🗑 Face encoding dihapus untuk {nim}")
     return {"success": True, "message": f"Wajah untuk {nim} berhasil direset."}
-

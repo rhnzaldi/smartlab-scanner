@@ -8,6 +8,12 @@ dist/
 build/
 .eggs/
 
+# ── Environment Variables (credentials) ──
+.env
+dist/
+build/
+.eggs/
+
 # ── Virtual Environment ──
 .venv/
 venv/
