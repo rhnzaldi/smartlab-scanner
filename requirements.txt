@@ -22,7 +22,13 @@ onnxruntime>=1.16.0
 
 # === Database (MySQL) ===
 PyMySQL>=1.1.0
+DBUtils>=3.0.3
 python-dotenv>=1.0.0
+
+# === Authentication & Security ===
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1
 
 # === Testing ===
 pytest>=7.0.0

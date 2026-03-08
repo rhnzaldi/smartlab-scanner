@@ -62,8 +62,16 @@ def get_dummy_face_base64() -> str:
 # Tests
 # ────────────────────────────────────────────────────────
 
-ADMIN_HEADERS = {"X-Admin-Key": os.environ.get("ADMIN_API_KEY", "CHANGE-ME-IN-PRODUCTION")}
-
+def get_admin_token() -> dict:
+    """Helper untuk men-generate bearer token via login route testclient."""
+    login_data = {
+        "username": "admin",
+        "password": "admin123"
+    }
+    res = client.post("/api/auth/login", data=login_data)
+    if res.status_code == 200:
+        return {"Authorization": f"Bearer {res.json()['access_token']}"}
+    return {}
 
 def test_health_check():
     """Test health check selalu jalan."""
@@ -74,7 +82,8 @@ def test_health_check():
 
 def test_api_status_empty():
     """Test get status waktu lab kosong (requires admin key)."""
-    res = client.get("/api/status", headers=ADMIN_HEADERS)
+    headers = get_admin_token()
+    res = client.get("/api/status", headers=headers)
     assert res.status_code == 200
     data = res.json()
     assert data["active_count"] == 0
@@ -88,7 +97,8 @@ def test_api_status_unauthorized():
 
 def test_api_checkout_not_found():
     """Test checkout NIM yang belum masuk."""
-    res = client.post(f"/api/checkout/{TEST_NIM}")
+    headers = get_admin_token()
+    res = client.post(f"/api/checkout/{TEST_NIM}", headers=headers)
     assert res.status_code == 200
     assert res.json()["success"] == False
     assert "tidak memiliki peminjaman aktif" in res.json()["message"]
@@ -123,7 +133,8 @@ def test_api_face_enroll_no_face_detected():
 
 def test_api_face_reset():
     """Test admin reset endpoint berfungsi dengan api key."""
-    res = client.delete(f"/api/face/{TEST_NIM}", headers=ADMIN_HEADERS)
+    headers = get_admin_token()
+    res = client.delete(f"/api/face/{TEST_NIM}", headers=headers)
     assert res.status_code == 200
 
     with get_connection() as conn:

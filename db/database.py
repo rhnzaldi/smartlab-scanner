@@ -25,6 +25,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+from dbutils.pooled_db import PooledDB
+
 # ────────────────────────────────────────────────────────
 # Constants [M1]
 # ────────────────────────────────────────────────────────
@@ -41,37 +43,44 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 # ────────────────────────────────────────────────────────
-# Connection Management [R1]
+# Connection Management (Pooled) [R1] [NFR-R]
 # ────────────────────────────────────────────────────────
+# Inisialisasi Connection Pool Global menggunakan DBUtils
+db_pool = PooledDB(
+    creator=pymysql,
+    maxconnections=20,     # Max 20 concurrent connections
+    mincached=2,           # Keep at least 2 connections alive
+    maxcached=5,           # Maksimum 5 idle connections di memory
+    blocking=True,         # Jika pool penuh, tunggu sampai ada yang kosong
+    ping=1,                # Check koneksi aktif sebelum digunakan
+    host=DB_HOST,
+    port=DB_PORT,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    database=DB_NAME,
+    cursorclass=DictCursor,
+    charset="utf8mb4",
+    autocommit=False,
+)
+
 @contextmanager
 def get_connection():
     """
-    Context manager untuk MySQL connection via PyMySQL.
-    Otomatis commit saat sukses, rollback saat error, selalu close.
-
-    Usage:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT ...")
+    Context manager untuk MySQL connection via PooledDB.
+    Berfungsi mengambil koneksi idle dari memory (sangat cepat).
+    Otomatis commit saat sukses, rollback saat error, membebaskan koneksi kembali ke pool.
     """
-    conn = pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        cursorclass=DictCursor,
-        charset="utf8mb4",
-        autocommit=False,
-    )
+    conn = db_pool.connection()
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        logger.error(f"❌ DB Transaction Error: {e}")
         raise
     finally:
-        conn.close()
+        conn.close() # Return connection to pool rather than dropping it
+
 
 
 # ────────────────────────────────────────────────────────
@@ -133,7 +142,34 @@ def init_db():
             except pymysql.err.OperationalError:
                 pass  # index already exists
 
-            # Seed data
+            # Tabel admin_users
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS admin_users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    email VARCHAR(100) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # Seed default admin
+            cursor.execute("SELECT COUNT(*) AS cnt FROM admin_users")
+            if cursor.fetchone()["cnt"] == 0:
+                # Import di sini untuk hindari circular import
+                from security import get_password_hash
+                cursor.execute("""
+                    INSERT INTO admin_users (username, email, password_hash)
+                    VALUES (%s, %s, %s)
+                """, (
+                    "admin",
+                    "admin@smartlab.id",
+                    get_password_hash("admin123"),
+                ))
+                logger.info("✅ Seed admin: username=admin, password=admin123")
+
+            # Seed data mahasiswa
             cursor.execute("SELECT COUNT(*) AS cnt FROM mahasiswa")
             if cursor.fetchone()["cnt"] == 0:
                 cursor.execute("""
@@ -146,9 +182,24 @@ def init_db():
                     2023,
                     "aktif",
                 ))
-                logger.info("✅ Seed data: Muhammad Raihan Zaldiputra (J0403231061)")
+                logger.info("✅ Seed mahasiswa: Muhammad Raihan Zaldiputra")
 
     logger.info(f"✅ Database ready: {DB_NAME}@{DB_HOST}:{DB_PORT}")
+
+
+# ────────────────────────────────────────────────
+# Admin User Functions
+# ────────────────────────────────────────────────
+@_timed_db_op
+def get_admin_by_username(username: str) -> Optional[Dict]:
+    """Cari admin berdasarkan username. Returns dict atau None."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, username, email, password_hash, is_active FROM admin_users WHERE username = %s",
+                (username,)
+            )
+            return cursor.fetchone()
 
 
 # ────────────────────────────────────────────────────────
@@ -265,42 +316,83 @@ def _format_duration(start_str: str, end_str: str) -> str:
 
 
 @_timed_db_op
+def has_active_peminjaman(nim: str) -> bool:
+    """Cek apakah mahasiswa sedang memiliki peminjaman aktif atau menunggu."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM peminjaman WHERE nim = %s AND status IN ('aktif', 'menunggu')",
+                (nim,)
+            )
+            return cursor.fetchone() is not None
+
+
+@_timed_db_op
 def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
     """
     Catat mahasiswa masuk lab.
-    [R1] Context manager untuk auto-close connection.
+    Sesi awal berstatus 'menunggu' (harus di-ACC admin).
     """
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            # Cek peminjaman aktif
+            # Cek peminjaman aktif/menunggu
             cursor.execute(
-                "SELECT id, waktu_masuk FROM peminjaman WHERE nim = %s AND status = 'aktif'",
+                "SELECT id, status, waktu_masuk FROM peminjaman WHERE nim = %s AND status IN ('aktif', 'menunggu')",
                 (nim,)
             )
             active = cursor.fetchone()
 
             if active:
+                state_msg = "di dalam lab" if active['status'] == 'aktif' else "menunggu ACC admin"
                 return {
                     "success": False,
-                    "message": f"⚠️ {nim} sudah check-in sejak {active['waktu_masuk']}",
+                    "message": f"⚠️ {nim} sudah {state_msg} sejak {active['waktu_masuk']}",
                     "peminjaman_id": active["id"],
                 }
 
-            # Insert peminjaman baru
+            # Insert peminjaman baru (status 'menunggu')
             now = datetime.now().strftime(TIMESTAMP_FORMAT)
             cursor.execute(
-                "INSERT INTO peminjaman (nim, lab, waktu_masuk, status) VALUES (%s, %s, %s, 'aktif')",
+                "INSERT INTO peminjaman (nim, lab, waktu_masuk, status) VALUES (%s, %s, %s, 'menunggu')",
                 (nim, lab, now)
             )
             pid = cursor.lastrowid
 
-    logger.info(f"📥 Check-in: {nim} → {lab} (ID: {pid})")
+    logger.info(f"⏳ Check-in pending ACC: {nim} → {lab} (ID: {pid})")
     return {
         "success": True,
-        "message": f"📥 Check-in berhasil! Selamat datang di {lab}",
+        "message": f"⏳ Verifikasi Wajah Berhasil! Menunggu persetujuan Admin lab.",
         "peminjaman_id": pid,
         "waktu_masuk": now,
     }
+
+@_timed_db_op
+def approve_peminjaman(pid: int) -> Dict:
+    """Ubah status peminjaman dari 'menunggu' menjadi 'aktif'."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE peminjaman SET status = 'aktif' WHERE id = %s AND status = 'menunggu'", (pid,))
+            if cursor.rowcount == 0:
+                 return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+    
+    logger.info(f"✅ Approve peminjaman ID: {pid}")
+    return {"success": True, "message": "Peminjaman disetujui (Aktif)."}
+
+@_timed_db_op
+def reject_peminjaman(pid: int) -> Dict:
+    """Tolak peminjaman, ubah status dari 'menunggu' menjadi 'ditolak'."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            now = datetime.now().strftime(TIMESTAMP_FORMAT)
+            cursor.execute(
+                "UPDATE peminjaman SET status = 'ditolak', waktu_keluar = %s WHERE id = %s AND status = 'menunggu'", 
+                (now, pid)
+            )
+            if cursor.rowcount == 0:
+                 return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+    
+    logger.warning(f"❌ Reject peminjaman ID: {pid}")
+    return {"success": True, "message": "Peminjaman ditolak."}
 
 
 @_timed_db_op
@@ -349,14 +441,14 @@ def check_out(nim: str) -> Dict:
 
 @_timed_db_op
 def get_active_peminjaman() -> List[Dict]:
-    """List semua peminjaman aktif."""
+    """List semua peminjaman yang aktif atau sedang menunggu ACC."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT p.*, m.nama
                 FROM peminjaman p
                 JOIN mahasiswa m ON p.nim = m.nim
-                WHERE p.status = 'aktif'
+                WHERE p.status IN ('aktif', 'menunggu')
                 ORDER BY p.waktu_masuk DESC
             """)
             return cursor.fetchall()

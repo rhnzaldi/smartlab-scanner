@@ -36,18 +36,21 @@ from pydantic import BaseModel
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends, Security
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.security.api_key import APIKeyHeader
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError
 
 from ml.pipeline import KTMPipeline, ScanResult
 from ml.face_verify import FaceVerifier
 from db.database import (
     init_db, verify_student, check_in, check_out,
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
-    save_face_encoding, load_face_encoding, delete_face_encoding
+    save_face_encoding, load_face_encoding, delete_face_encoding,
+    get_admin_by_username,
 )
+from security import verify_password, create_access_token, decode_token
 
 # ────────────────────────────────────────────────────────
 # Constants [M1]
@@ -62,21 +65,27 @@ ALLOWED_ORIGINS = os.environ.get(
     "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
 ).split(",")
 
-# Admin API Key [S5] — from env var, WAJIB diset di production!
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "CHANGE-ME-IN-PRODUCTION")
-_api_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+# ─── JWT Auth (menggantikan ADMIN_API_KEY) ───────────────
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
-async def require_admin_key(api_key: Optional[str] = Security(_api_key_header)):
+async def get_current_admin(token: str = Depends(oauth2_scheme)):
     """
-    [S5] Dependency Guard untuk endpoint admin.
-    Membutuhkan header: X-Admin-Key: <ADMIN_API_KEY>
+    JWT Dependency Guard untuk endpoint admin.
+    Verifikasi Bearer token dari header Authorization.
     """
-    if api_key != ADMIN_API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized. Header X-Admin-Key diperlukan."
-        )
+    try:
+        payload = decode_token(token)
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Token tidak valid.")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token tidak valid atau kedaluwarsa.")
+
+    admin = get_admin_by_username(username)
+    if not admin or not admin.get("is_active"):
+        raise HTTPException(status_code=401, detail="Akun admin tidak aktif atau tidak ditemukan.")
+    return admin
 
 
 # ────────────────────────────────────────────────────────
@@ -218,6 +227,9 @@ def _process_scan_result(result: ScanResult) -> dict:
     response = result.to_dict()
 
     if result.nim_final and result.nama:
+        # Import lazy to avoid circular dependency since database is imported above globally 
+        from db.database import has_active_peminjaman
+        
         db_res = verify_student(result.nim_final, result.nama)
         response["db_verified"] = db_res["verified"]
         response["db_nama"] = db_res.get("nama_db")
@@ -225,11 +237,17 @@ def _process_scan_result(result: ScanResult) -> dict:
         response["db_message"] = db_res.get("message")
 
         if db_res["verified"]:
-            # Cek apakah sudah punya face encoding di DB
-            db_encoding = load_face_encoding(result.nim_final)
-            response["action_required"] = (
-                "face_verify" if db_encoding is not None else "face_enroll"
-            )
+            # Cek dulu apakah mahasiswa ini sudah/sedang di dalam lab (punya sesi aktif)
+            if has_active_peminjaman(result.nim_final):
+                response["action_required"] = "already_checked_in"
+                nama_panggilan = response.get('db_nama', result.nim_final)
+                response["db_message"] = f"Mahasiswa atas nama {nama_panggilan} ({result.nim_final}) masih memiliki sesi di dalam lab. Silakan check-out terlebih dahulu."
+            else:
+                # Cek apakah sudah punya face encoding di DB
+                db_encoding = load_face_encoding(result.nim_final)
+                response["action_required"] = (
+                    "face_verify" if db_encoding is not None else "face_enroll"
+                )
 
     return response
 
@@ -357,12 +375,12 @@ async def api_face_enroll(req: FaceRequest):
     nim = _validate_nim(req.nim)
 
     # Validasi: NIM harus ada di DB & (opsional) Nama sesuai dengan KTM
-    db_res = verify_student(nim, req.nama)
+    db_res = await asyncio.to_thread(verify_student, nim, req.nama)
     if not db_res.get("verified"):
         raise HTTPException(status_code=404, detail=db_res.get("message", "NIM tidak ditemukan / Nama tidak cocok"))
 
     # Validasi: belum punya encoding (jika sudah ada, pakai /verify)
-    existing = load_face_encoding(nim)
+    existing = await asyncio.to_thread(load_face_encoding, nim)
     if existing is not None:
         raise HTTPException(
             status_code=409,
@@ -388,9 +406,9 @@ async def api_face_enroll(req: FaceRequest):
             "processing_time_ms": elapsed,
         })
 
-    # Simpan encoding ke DB + check-in
-    save_face_encoding(nim, enroll_res["encoding"])
-    ci = check_in(nim)
+    # Simpan encoding ke DB + check-in (Aman dari Race Condition)
+    await asyncio.to_thread(save_face_encoding, nim, enroll_res["encoding"])
+    ci = await asyncio.to_thread(check_in, nim)
 
     return FaceResponse(
         status="enrolled",
@@ -418,12 +436,12 @@ async def api_face_verify(req: FaceRequest):
     nim = _validate_nim(req.nim)
 
     # Validasi: NIM harus ada di DB
-    db_res = verify_student(nim, req.nama)
+    db_res = await asyncio.to_thread(verify_student, nim, req.nama)
     if not db_res.get("verified"):
         raise HTTPException(status_code=404, detail=db_res.get("message", "NIM tidak ditemukan / Nama tidak cocok"))
 
     # Validasi: harus sudah punya encoding
-    db_encoding = load_face_encoding(nim)
+    db_encoding = await asyncio.to_thread(load_face_encoding, nim)
     if db_encoding is None:
         raise HTTPException(
             status_code=404,
@@ -445,7 +463,15 @@ async def api_face_verify(req: FaceRequest):
     elapsed = round((time.perf_counter() - t_start) * 1000, 1)
 
     if verify_res["verified"]:
-        ci = check_in(nim)
+        ci = await asyncio.to_thread(check_in, nim)
+        
+        # Block: Jika mahasiswa sudah punya sesi aktif, tolak verifikasi lagi
+        if not ci.get("success"):
+            raise HTTPException(
+                status_code=409,
+                detail=ci.get("message", "Mahasiswa sedang berada di dalam lab.")
+            )
+
         return FaceResponse(
             status="verified",
             nim=nim,
@@ -465,9 +491,9 @@ async def api_face_verify(req: FaceRequest):
 
 @app.delete(
     "/api/face/{nim}",
-    dependencies=[Depends(require_admin_key)],
+    dependencies=[Depends(get_current_admin)],
     responses={
-        401: {"description": "Unauthorized — Header X-Admin-Key salah/tidak ada"},
+        401: {"description": "Unauthorized — Token JWT tidak valid/kedaluwarsa"},
         404: {"description": "NIM tidak ditemukan"},
     }
 )
@@ -475,34 +501,81 @@ async def api_face_reset(nim: str):
     """
     [ADMIN] Reset / hapus face encoding mahasiswa dari database.
     Berguna jika mahasiswa salah melakukan enrollment wajah.
-    Membutuhkan: Header `X-Admin-Key: <ADMIN_API_KEY>`
+    Membutuhkan: Bearer Token JWT dari /api/auth/login
     """
     nim = _validate_nim(nim)
-    res = delete_face_encoding(nim)
+    res = await asyncio.to_thread(delete_face_encoding, nim)
     if not res["success"]:
         raise HTTPException(status_code=404, detail=res["message"])
     return {"status": "success", "message": res["message"]}
 
 # ────────────────────────────────────────────────────────
-# Checkout & Status Endpoints
+# Checkout, Status, & ACC Endpoints
 # ────────────────────────────────────────────────────────
-@app.post("/api/checkout/{nim}")
+# ─── Login & Status Endpoints ────────────────────────────
+
+@app.post("/api/auth/login")
+async def api_login(form: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login admin. Return JWT access token.
+    Format input: form-data (username + password)
+    """
+    admin = get_admin_by_username(form.username)
+    if not admin or not verify_password(form.password, admin["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Username atau password salah.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not admin.get("is_active"):
+        raise HTTPException(status_code=403, detail="Akun admin tidak aktif.")
+
+    token = create_access_token(data={"sub": admin["username"]})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/api/checkout/{nim}", dependencies=[Depends(get_current_admin)])
 async def api_checkout(nim: str):
-    """Check-out mahasiswa dari lab. [S2] NIM validated."""
+    """[ADMIN] Check-out mahasiswa dari lab. Membutuhkan Bearer Token."""
     nim = _validate_nim(nim)
-    return check_out(nim)
+    return await asyncio.to_thread(check_out, nim)
+
+@app.post("/api/peminjaman/{pid}/approve", dependencies=[Depends(get_current_admin)])
+async def api_approve(pid: int):
+    """[ADMIN] Setujui mahasiswa masuk ke dalam lab (ubah status menunggu -> aktif)"""
+    from db.database import approve_peminjaman
+    res = await asyncio.to_thread(approve_peminjaman, pid)
+    if not res["success"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return res
+
+@app.post("/api/peminjaman/{pid}/reject", dependencies=[Depends(get_current_admin)])
+async def api_reject(pid: int):
+    """[ADMIN] Tolak mahasiswa masuk ke dalam lab (ubah status menunggu -> ditolak)"""
+    from db.database import reject_peminjaman
+    res = await asyncio.to_thread(reject_peminjaman, pid)
+    if not res["success"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return res
 
 
 @app.get(
     "/api/status",
-    dependencies=[Depends(require_admin_key)]
+    dependencies=[Depends(get_current_admin)]
 )
 async def api_status():
-    """[ADMIN] List peminjaman aktif. Membutuhkan X-Admin-Key header."""
-    active = get_active_peminjaman()
+    """[ADMIN] List peminjaman aktif & menunggu ACC. Membutuhkan Bearer Token JWT."""
+    peminjaman_list = await asyncio.to_thread(get_active_peminjaman)
+    
+    # Split them for frontend convenience
+    active = [p for p in peminjaman_list if p["status"] == "aktif"]
+    pending = [p for p in peminjaman_list if p["status"] == "menunggu"]
+    
     return {
         "active_count": len(active),
+        "pending_count": len(pending),
         "peminjaman": active,
+        "peminjaman_pending": pending
     }
 
 
