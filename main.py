@@ -49,6 +49,12 @@ from db.database import (
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
     save_face_encoding, load_face_encoding, delete_face_encoding,
     get_admin_by_username,
+    # Lab management
+    get_labs, get_lab, create_lab, update_lab, delete_lab,
+    # Schedule (Jadwal)
+    get_jadwal, get_jadwal_item, create_jadwal, update_jadwal, delete_jadwal, archive_all_jadwal,
+    # Reporting
+    get_peminjaman_history,
 )
 from security import verify_password, create_access_token, decode_token
 
@@ -124,6 +130,30 @@ class FaceResponse(BaseModel):
     processing_time_ms: float
 
 
+class LabPayload(BaseModel):
+    name: str
+    location: str
+    capacity: int
+    op_start: str
+    op_end: str
+    use_start: str
+    use_end: str
+    equipment: Optional[list[str]] = []
+    status_override: Optional[str] = None
+
+
+class SchedulePayload(BaseModel):
+    mata_kuliah: str
+    kelas: str
+    prodi: str
+    lab: str
+    gedung: str
+    hari: str
+    jam_mulai: str
+    jam_selesai: str
+    tipe_semester: str
+    tahun_ajaran: str
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -157,7 +187,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -577,6 +607,140 @@ async def api_status():
         "peminjaman": active,
         "peminjaman_pending": pending
     }
+
+
+# ────────────────────────────────────────────────────────
+# Lab Management Endpoints
+# ────────────────────────────────────────────────────────
+@app.get("/api/labs", dependencies=[Depends(get_current_admin)])
+async def api_get_labs():
+    """[ADMIN] List semua laboratorium."""
+    return await asyncio.to_thread(get_labs)
+
+
+@app.post("/api/labs", dependencies=[Depends(get_current_admin)])
+async def api_create_lab(payload: LabPayload):
+    """[ADMIN] Buat laboratorium baru."""
+    return await asyncio.to_thread(
+        create_lab,
+        payload.name,
+        payload.location,
+        payload.capacity,
+        payload.op_start,
+        payload.op_end,
+        payload.use_start,
+        payload.use_end,
+        payload.equipment or [],
+        payload.status_override,
+    )
+
+
+@app.put("/api/labs/{lab_id}", dependencies=[Depends(get_current_admin)])
+async def api_update_lab(lab_id: int, payload: LabPayload):
+    """[ADMIN] Update data laboratorium."""
+    updated = await asyncio.to_thread(
+        update_lab,
+        lab_id,
+        payload.name,
+        payload.location,
+        payload.capacity,
+        payload.op_start,
+        payload.op_end,
+        payload.use_start,
+        payload.use_end,
+        payload.equipment or [],
+        payload.status_override,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Lab tidak ditemukan")
+    return updated
+
+
+@app.delete("/api/labs/{lab_id}", dependencies=[Depends(get_current_admin)])
+async def api_delete_lab(lab_id: int):
+    """[ADMIN] Hapus lab."""
+    success = await asyncio.to_thread(delete_lab, lab_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Lab tidak ditemukan")
+    return {"success": True}
+
+
+# ────────────────────────────────────────────────────────
+# Schedule (Jadwal) Endpoints
+# ────────────────────────────────────────────────────────
+@app.get("/api/jadwal", dependencies=[Depends(get_current_admin)])
+async def api_get_jadwal(archived: bool = False):
+    """[ADMIN] List jadwal laboratorium."""
+    return await asyncio.to_thread(get_jadwal, archived)
+
+
+@app.post("/api/jadwal", dependencies=[Depends(get_current_admin)])
+async def api_create_jadwal(payload: SchedulePayload):
+    """[ADMIN] Buat jadwal baru."""
+    return await asyncio.to_thread(
+        create_jadwal,
+        payload.mata_kuliah,
+        payload.kelas,
+        payload.prodi,
+        payload.lab,
+        payload.gedung,
+        payload.hari,
+        payload.jam_mulai,
+        payload.jam_selesai,
+        payload.tipe_semester,
+        payload.tahun_ajaran,
+    )
+
+
+@app.put("/api/jadwal/{jadwal_id}", dependencies=[Depends(get_current_admin)])
+async def api_update_jadwal(jadwal_id: int, payload: SchedulePayload):
+    """[ADMIN] Update jadwal."""
+    updated = await asyncio.to_thread(
+        update_jadwal,
+        jadwal_id,
+        payload.mata_kuliah,
+        payload.kelas,
+        payload.prodi,
+        payload.lab,
+        payload.gedung,
+        payload.hari,
+        payload.jam_mulai,
+        payload.jam_selesai,
+        payload.tipe_semester,
+        payload.tahun_ajaran,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+    return updated
+
+
+@app.delete("/api/jadwal/{jadwal_id}", dependencies=[Depends(get_current_admin)])
+async def api_delete_jadwal(jadwal_id: int):
+    """[ADMIN] Hapus jadwal."""
+    success = await asyncio.to_thread(delete_jadwal, jadwal_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+    return {"success": True}
+
+
+@app.post("/api/jadwal/archive", dependencies=[Depends(get_current_admin)])
+async def api_archive_jadwal():
+    """[ADMIN] Archive semua jadwal (reset semester)."""
+    count = await asyncio.to_thread(archive_all_jadwal)
+    return {"success": True, "archived_count": count}
+
+
+# ────────────────────────────────────────────────────────
+# Reporting Endpoints
+# ────────────────────────────────────────────────────────
+@app.get("/api/reports/peminjaman", dependencies=[Depends(get_current_admin)])
+async def api_get_peminjaman_history(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    prodi: Optional[str] = None,
+):
+    """[ADMIN] Ambil riwayat peminjaman (peminjaman selesai/ditolak)."""
+    return await asyncio.to_thread(get_peminjaman_history, year, month, prodi)
 
 
 # ────────────────────────────────────────────────────────

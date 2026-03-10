@@ -16,6 +16,7 @@ import logging
 import os
 import functools
 import time
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, Dict, List, Any
@@ -169,6 +170,96 @@ def init_db():
                 ))
                 logger.info("✅ Seed admin: username=admin, password=admin123")
 
+            # Tabel labs (untuk manajemen laboratorium)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS labs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    location VARCHAR(100) NOT NULL,
+                    capacity INT DEFAULT 0,
+                    op_start TIME,
+                    op_end TIME,
+                    use_start TIME,
+                    use_end TIME,
+                    equipment JSON,
+                    status_override VARCHAR(20),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # Tabel jadwal (schedule)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS jadwal (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    mata_kuliah VARCHAR(150) NOT NULL,
+                    kelas VARCHAR(50) NOT NULL,
+                    prodi VARCHAR(100) NOT NULL,
+                    lab VARCHAR(100) NOT NULL,
+                    gedung VARCHAR(100) NOT NULL,
+                    hari VARCHAR(20) NOT NULL,
+                    jam_mulai TIME NOT NULL,
+                    jam_selesai TIME NOT NULL,
+                    tipe_semester VARCHAR(50) NOT NULL,
+                    tahun_ajaran VARCHAR(20) NOT NULL,
+                    is_archived BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # Seed sample lab data
+            cursor.execute("SELECT COUNT(*) AS cnt FROM labs")
+            if cursor.fetchone()["cnt"] == 0:
+                cursor.execute("""
+                    INSERT INTO labs (name, location, capacity, op_start, op_end, use_start, use_end, equipment, status_override)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    "Lab Jaringan 01",
+                    "Gedung Delta",
+                    25,
+                    "07:00:00",
+                    "18:00:00",
+                    "08:00:00",
+                    "11:00:00",
+                    json.dumps(["PC Intel Core i5", "Router Cisco"]),
+                    None,
+                ))
+                logger.info("✅ Seed lab: Lab Jaringan 01")
+
+            # Seed sample jadwal
+            cursor.execute("SELECT COUNT(*) AS cnt FROM jadwal")
+            if cursor.fetchone()["cnt"] == 0:
+                cursor.execute("""
+                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    "Pemrograman Web Lanjut",
+                    "INF-P1",
+                    "Informatika",
+                    "Lab 01",
+                    "Delta",
+                    "Senin",
+                    "08:00:00",
+                    "10:30:00",
+                    "Genap",
+                    "2025/2026",
+                ))
+                cursor.execute("""
+                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    "Jaringan Komputer",
+                    "TEK-P2",
+                    "Teknik Komputer",
+                    "Lab Jaringan",
+                    "Epsilon",
+                    "Rabu",
+                    "13:00:00",
+                    "15:30:00",
+                    "Genap",
+                    "2025/2026",
+                ))
+                logger.info("✅ Seed jadwal laboratorium")
+
             # Seed data mahasiswa
             cursor.execute("SELECT COUNT(*) AS cnt FROM mahasiswa")
             if cursor.fetchone()["cnt"] == 0:
@@ -200,6 +291,303 @@ def get_admin_by_username(username: str) -> Optional[Dict]:
                 (username,)
             )
             return cursor.fetchone()
+
+
+# ────────────────────────────────────────────────────────
+# Lab Management Functions
+# ────────────────────────────────────────────────────────
+@_timed_db_op
+def get_labs() -> List[Dict]:
+    """Ambil daftar laboratorium."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM labs ORDER BY id")
+            labs = cursor.fetchall()
+
+    # Convert JSON string to list if needed, and format timedeltas
+    for lab in labs:
+        if lab.get("equipment") and isinstance(lab["equipment"], str):
+            try:
+                lab["equipment"] = json.loads(lab["equipment"])
+            except Exception:
+                lab["equipment"] = []
+                
+        # Format timedelta properly to HH:MM
+        for key in ["op_start", "op_end", "use_start", "use_end"]:
+            if lab.get(key) is not None:
+                s = str(lab[key])
+                if len(s) == 7: s = "0" + s
+                lab[key] = s[:5] if len(s) >= 5 else s
+    
+    return labs
+
+
+@_timed_db_op
+def get_lab(lab_id: int) -> Optional[Dict]:
+    """Ambil detail satu laboratorium."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM labs WHERE id = %s", (lab_id,))
+            lab = cursor.fetchone()
+
+    if not lab:
+        return None
+
+    if lab.get("equipment") and isinstance(lab["equipment"], str):
+        try:
+            lab["equipment"] = json.loads(lab["equipment"])
+        except Exception:
+            lab["equipment"] = []
+            
+    # Format timedelta properly to HH:MM
+    for key in ["op_start", "op_end", "use_start", "use_end"]:
+        if lab.get(key) is not None:
+            s = str(lab[key])
+            if len(s) == 7: s = "0" + s
+            lab[key] = s[:5] if len(s) >= 5 else s
+
+    return lab
+
+
+@_timed_db_op
+def create_lab(
+    name: str,
+    location: str,
+    capacity: int,
+    op_start: str,
+    op_end: str,
+    use_start: str,
+    use_end: str,
+    equipment: List[str],
+    status_override: Optional[str] = None,
+) -> Dict:
+    """Buat lab baru."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                    INSERT INTO labs (name, location, capacity, op_start, op_end, use_start, use_end, equipment, status_override)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    name,
+                    location,
+                    capacity,
+                    op_start,
+                    op_end,
+                    use_start,
+                    use_end,
+                    json.dumps(equipment),
+                    status_override,
+                ),
+            )
+            lab_id = cursor.lastrowid
+
+    return get_lab(lab_id)
+
+
+@_timed_db_op
+def update_lab(
+    lab_id: int,
+    name: str,
+    location: str,
+    capacity: int,
+    op_start: str,
+    op_end: str,
+    use_start: str,
+    use_end: str,
+    equipment: List[str],
+    status_override: Optional[str] = None,
+) -> Optional[Dict]:
+    """Perbarui data lab."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                    UPDATE labs
+                    SET name=%s, location=%s, capacity=%s, op_start=%s, op_end=%s,
+                        use_start=%s, use_end=%s, equipment=%s, status_override=%s
+                    WHERE id=%s
+                """,
+                (
+                    name,
+                    location,
+                    capacity,
+                    op_start,
+                    op_end,
+                    use_start,
+                    use_end,
+                    json.dumps(equipment),
+                    status_override,
+                    lab_id,
+                ),
+            )
+            # Not checking rowcount == 0 to return None, 
+            # because MySQL rowcount is 0 if data isn't changed.
+            
+    return get_lab(lab_id)
+
+
+@_timed_db_op
+def delete_lab(lab_id: int) -> bool:
+    """Hapus lab."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM labs WHERE id = %s", (lab_id,))
+            return cursor.rowcount > 0
+
+
+# ────────────────────────────────────────────────────────
+# Schedule (Jadwal) Functions
+# ────────────────────────────────────────────────────────
+@_timed_db_op
+def get_jadwal(include_archived: bool = False) -> List[Dict]:
+    """Ambil jadwal laboratorium.
+
+    Args:
+        include_archived: Jika True, kembalikan semua jadwal (termasuk yang diarsipkan).
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            if include_archived:
+                cursor.execute("SELECT * FROM jadwal ORDER BY id")
+            else:
+                cursor.execute("SELECT * FROM jadwal WHERE is_archived = FALSE ORDER BY id")
+            jadwal_list = cursor.fetchall()
+
+    for jadwal in jadwal_list:
+        if jadwal.get("jam_mulai") is not None:
+            s = str(jadwal["jam_mulai"])
+            if len(s) == 7: s = "0" + s
+            jadwal["jam_mulai"] = s[:5] if len(s) >= 5 else s
+        if jadwal.get("jam_selesai") is not None:
+            s = str(jadwal["jam_selesai"])
+            if len(s) == 7: s = "0" + s
+            jadwal["jam_selesai"] = s[:5] if len(s) >= 5 else s
+
+    return jadwal_list
+
+
+@_timed_db_op
+def get_jadwal_item(jadwal_id: int) -> Optional[Dict]:
+    """Ambil satu entri jadwal berdasarkan ID."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM jadwal WHERE id = %s", (jadwal_id,))
+            jadwal = cursor.fetchone()
+
+    if jadwal:
+        if jadwal.get("jam_mulai") is not None:
+            s = str(jadwal["jam_mulai"])
+            if len(s) == 7: s = "0" + s
+            jadwal["jam_mulai"] = s[:5] if len(s) >= 5 else s
+        if jadwal.get("jam_selesai") is not None:
+            s = str(jadwal["jam_selesai"])
+            if len(s) == 7: s = "0" + s
+            jadwal["jam_selesai"] = s[:5] if len(s) >= 5 else s
+
+    return jadwal
+
+
+@_timed_db_op
+def create_jadwal(
+    mata_kuliah: str,
+    kelas: str,
+    prodi: str,
+    lab: str,
+    gedung: str,
+    hari: str,
+    jam_mulai: str,
+    jam_selesai: str,
+    tipe_semester: str,
+    tahun_ajaran: str,
+) -> Dict:
+    """Buat entri jadwal baru."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    mata_kuliah,
+                    kelas,
+                    prodi,
+                    lab,
+                    gedung,
+                    hari,
+                    jam_mulai,
+                    jam_selesai,
+                    tipe_semester,
+                    tahun_ajaran,
+                ),
+            )
+            jadwal_id = cursor.lastrowid
+
+    return get_jadwal_item(jadwal_id)
+
+
+@_timed_db_op
+def update_jadwal(
+    jadwal_id: int,
+    mata_kuliah: str,
+    kelas: str,
+    prodi: str,
+    lab: str,
+    gedung: str,
+    hari: str,
+    jam_mulai: str,
+    jam_selesai: str,
+    tipe_semester: str,
+    tahun_ajaran: str,
+) -> Optional[Dict]:
+    """Update entri jadwal."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                    UPDATE jadwal
+                    SET mata_kuliah=%s, kelas=%s, prodi=%s, lab=%s, gedung=%s,
+                        hari=%s, jam_mulai=%s, jam_selesai=%s, tipe_semester=%s, tahun_ajaran=%s
+                    WHERE id=%s
+                """,
+                (
+                    mata_kuliah,
+                    kelas,
+                    prodi,
+                    lab,
+                    gedung,
+                    hari,
+                    jam_mulai,
+                    jam_selesai,
+                    tipe_semester,
+                    tahun_ajaran,
+                    jadwal_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+
+    return get_jadwal_item(jadwal_id)
+
+
+@_timed_db_op
+def delete_jadwal(jadwal_id: int) -> bool:
+    """Hapus jadwal."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM jadwal WHERE id = %s", (jadwal_id,))
+            return cursor.rowcount > 0
+
+
+@_timed_db_op
+def archive_all_jadwal() -> int:
+    """Archive semua jadwal (reset semester)."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE jadwal SET is_archived = TRUE WHERE is_archived = FALSE")
+            return cursor.rowcount
 
 
 # ────────────────────────────────────────────────────────
@@ -467,6 +855,44 @@ def reset_all_peminjaman() -> Dict:
 
     logger.info(f"🔄 Reset: {count} peminjaman aktif → selesai")
     return {"success": True, "message": f"🔄 Reset {count} peminjaman aktif", "count": count}
+
+
+# ────────────────────────────────────────────────────────
+# Reporting / History Functions
+# ────────────────────────────────────────────────────────
+@_timed_db_op
+def get_peminjaman_history(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    prodi: Optional[str] = None,
+) -> List[Dict]:
+    """Ambil riwayat peminjaman (peminjaman selesai/ditolak) dengan filter opsional."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            query = """
+                SELECT p.*, m.nama, m.prodi
+                FROM peminjaman p
+                LEFT JOIN mahasiswa m ON p.nim = m.nim
+            """
+            conditions = []
+            params: List[Any] = []
+
+            if year is not None:
+                conditions.append("YEAR(p.waktu_masuk) = %s")
+                params.append(year)
+            if month is not None:
+                conditions.append("MONTH(p.waktu_masuk) = %s")
+                params.append(month)
+            if prodi:
+                conditions.append("m.prodi = %s")
+                params.append(prodi)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            query += " ORDER BY p.waktu_masuk DESC"
+            cursor.execute(query, tuple(params))
+            return cursor.fetchall()
 
 
 # ────────────────────────────────────────────────────────
