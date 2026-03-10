@@ -430,6 +430,12 @@ async def api_face_enroll(req: FaceRequest):
     elapsed = round((time.perf_counter() - t_start) * 1000, 1)
 
     if not enroll_res["success"]:
+        if enroll_res.get("spoof_detected"):
+            raise HTTPException(
+                status_code=406,
+                detail=enroll_res.get("message", "Akses Ditolak: Indikasi Wajah Palsu/Spoofing.")
+            )
+            
         return JSONResponse(status_code=422, content={
             "status": "failed",
             "message": enroll_res["message"],
@@ -456,6 +462,7 @@ async def api_face_enroll(req: FaceRequest):
         400: {"description": "Format input/gambar Invalid"},
         403: {"description": "Wajah TIDAK cocok dengan DB"},
         404: {"description": "Wajah/NIM belum terdaftar"},
+        406: {"description": "Terdeteksi Indikasi Spoofing (Wajah Palsu / Layar HP)"},
     }
 )
 async def api_face_verify(req: FaceRequest):
@@ -491,6 +498,12 @@ async def api_face_verify(req: FaceRequest):
         verify_res = await asyncio.to_thread(fv.verify, frame)
         fv.clear_reference()  # Bersihkan state setelah selesai
     elapsed = round((time.perf_counter() - t_start) * 1000, 1)
+
+    if verify_res.get("spoof_detected"):
+        raise HTTPException(
+            status_code=406,
+            detail=verify_res.get("message", "Akses Ditolak: Indikasi Wajah Palsu/Spoofing.")
+        )
 
     if verify_res["verified"]:
         ci = await asyncio.to_thread(check_in, nim)

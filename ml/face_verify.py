@@ -101,6 +101,7 @@ class FaceVerifier:
             "success": False,
             "encoding": None,
             "face_detected": False,
+            "spoof_detected": False,
             "face_bbox": None,
             "message": "",
         }
@@ -117,9 +118,32 @@ class FaceVerifier:
             result["message"] = "Wajah tidak terdeteksi — hadap ke kamera"
             return result
 
-        # Get largest face (closest to camera)
         largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         x1, y1, x2, y2 = [int(v) for v in largest.bbox]
+        h, w = live_frame.shape[:2]
+
+        # --- BORDER CONSTRAINT ---
+        # Cegah pendaftaran wajah jika sebagian wajah terpotong layar
+        margin = 10  # 10 pixels deadzone
+        if x1 < margin or y1 < margin or x2 > (w - margin) or y2 > (h - margin):
+            result["message"] = "Wajah terpotong batas layar. Mundur sedikit ke tengah."
+            # Reject immediately
+            return result
+
+        # --- LIVENESS DETECTION (ANTI-SPOOFING) ---
+        from .antispoof import detector
+        h, w = live_frame.shape[:2]
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(w, x2), min(h, y2)
+        
+        if cx2 > cx1 and cy2 > cy1:
+            face_crop = live_frame[cy1:cy2, cx1:cx2]
+            liveness = detector.analyze_liveness(face_crop)
+            if not liveness["is_real"]:
+                result["message"] = f"Akses Ditolak: Terindikasi Gambar Palsu / Layar HP ({liveness['message']})"
+                result["spoof_detected"] = True
+                logger.warning(f"Spoofing Rejection during Enrollment: {liveness}")
+                return result
 
         result["face_detected"] = True
         result["face_bbox"] = (x1, y1, x2 - x1, y2 - y1)
@@ -143,6 +167,7 @@ class FaceVerifier:
             "verified": False,
             "similarity": 0.0,
             "face_detected": False,
+            "spoof_detected": False,
             "message": "",
             "face_bbox": None,
         }
@@ -162,6 +187,29 @@ class FaceVerifier:
         # Largest face
         largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         x1, y1, x2, y2 = [int(v) for v in largest.bbox]
+        h, w = live_frame.shape[:2]
+
+        # --- BORDER CONSTRAINT ---
+        margin = 10
+        if x1 < margin or y1 < margin or x2 > (w - margin) or y2 > (h - margin):
+            # Biarkan InsightFace lanjut mencocokkan? TIDAK, kita keras.
+            result["message"] = "Wajah terpotong batas layar. Mundur sedikit ke tengah."
+            return result
+
+        # --- LIVENESS DETECTION (ANTI-SPOOFING) ---
+        from .antispoof import detector
+        h, w = live_frame.shape[:2]
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(w, x2), min(h, y2)
+        
+        if cx2 > cx1 and cy2 > cy1:
+            face_crop = live_frame[cy1:cy2, cx1:cx2]
+            liveness = detector.analyze_liveness(face_crop)
+            if not liveness["is_real"]:
+                result["message"] = f"Akses Ditolak: Terindikasi Gambar Palsu / Layar HP ({liveness['message']})"
+                result["spoof_detected"] = True
+                logger.warning(f"Spoofing Rejection: {liveness}")
+                return result
 
         result["face_detected"] = True
         result["face_bbox"] = (x1, y1, x2 - x1, y2 - y1)
