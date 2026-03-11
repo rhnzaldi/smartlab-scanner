@@ -77,6 +77,7 @@ class ScanResult:
             "validation_detail": self.validation_detail,
             "detections_found": self.detections_found,
             "confidences": self.confidences,
+            "bboxes": self.bboxes,
             "inference_time_ms": round(self.inference_time_ms, 1),
             "total_time_ms": round(self.total_time_ms, 1),
         }
