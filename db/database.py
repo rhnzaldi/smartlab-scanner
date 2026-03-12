@@ -201,64 +201,12 @@ def init_db():
                     jam_selesai TIME NOT NULL,
                     tipe_semester VARCHAR(50) NOT NULL,
                     tahun_ajaran VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'tersedia',
                     is_archived BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
 
-            # Seed sample lab data
-            cursor.execute("SELECT COUNT(*) AS cnt FROM labs")
-            if cursor.fetchone()["cnt"] == 0:
-                cursor.execute("""
-                    INSERT INTO labs (name, location, capacity, op_start, op_end, use_start, use_end, equipment, status_override)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    "Lab Jaringan 01",
-                    "Gedung Delta",
-                    25,
-                    "07:00:00",
-                    "18:00:00",
-                    "08:00:00",
-                    "11:00:00",
-                    json.dumps(["PC Intel Core i5", "Router Cisco"]),
-                    None,
-                ))
-                logger.info("✅ Seed lab: Lab Jaringan 01")
-
-            # Seed sample jadwal
-            cursor.execute("SELECT COUNT(*) AS cnt FROM jadwal")
-            if cursor.fetchone()["cnt"] == 0:
-                cursor.execute("""
-                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    "Pemrograman Web Lanjut",
-                    "INF-P1",
-                    "Informatika",
-                    "Lab 01",
-                    "Delta",
-                    "Senin",
-                    "08:00:00",
-                    "10:30:00",
-                    "Genap",
-                    "2025/2026",
-                ))
-                cursor.execute("""
-                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    "Jaringan Komputer",
-                    "TEK-P2",
-                    "Teknik Komputer",
-                    "Lab Jaringan",
-                    "Epsilon",
-                    "Rabu",
-                    "13:00:00",
-                    "15:30:00",
-                    "Genap",
-                    "2025/2026",
-                ))
-                logger.info("✅ Seed jadwal laboratorium")
 
             # Seed data mahasiswa
             cursor.execute("SELECT COUNT(*) AS cnt FROM mahasiswa")
@@ -501,14 +449,15 @@ def create_jadwal(
     jam_selesai: str,
     tipe_semester: str,
     tahun_ajaran: str,
+    status: str = "tersedia",
 ) -> Dict:
     """Buat entri jadwal baru."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO jadwal (mata_kuliah, kelas, prodi, lab, gedung, hari, jam_mulai, jam_selesai, tipe_semester, tahun_ajaran, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     mata_kuliah,
@@ -521,6 +470,7 @@ def create_jadwal(
                     jam_selesai,
                     tipe_semester,
                     tahun_ajaran,
+                    status,
                 ),
             )
             jadwal_id = cursor.lastrowid
@@ -541,6 +491,7 @@ def update_jadwal(
     jam_selesai: str,
     tipe_semester: str,
     tahun_ajaran: str,
+    status: str,
 ) -> Optional[Dict]:
     """Update entri jadwal."""
     with get_connection() as conn:
@@ -549,7 +500,7 @@ def update_jadwal(
                 """
                     UPDATE jadwal
                     SET mata_kuliah=%s, kelas=%s, prodi=%s, lab=%s, gedung=%s,
-                        hari=%s, jam_mulai=%s, jam_selesai=%s, tipe_semester=%s, tahun_ajaran=%s
+                        hari=%s, jam_mulai=%s, jam_selesai=%s, tipe_semester=%s, tahun_ajaran=%s, status=%s
                     WHERE id=%s
                 """,
                 (
@@ -563,6 +514,7 @@ def update_jadwal(
                     jam_selesai,
                     tipe_semester,
                     tahun_ajaran,
+                    status,
                     jadwal_id,
                 ),
             )
@@ -762,6 +714,20 @@ def approve_peminjaman(pid: int) -> Dict:
             cursor.execute("UPDATE peminjaman SET status = 'aktif' WHERE id = %s AND status = 'menunggu'", (pid,))
             if cursor.rowcount == 0:
                  return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+            
+            # Fetch lab info of the approved active session
+            cursor.execute("SELECT lab FROM peminjaman WHERE id = %s", (pid,))
+            lab_res = cursor.fetchone()
+            if lab_res:
+                lab = lab_res["lab"]
+                # Coba temukan jadwal aktif saat ini untuk lab tersebut dan tandai digunakan
+                now_str = datetime.now().strftime("%H:%M:%S")
+                # Karena MariaDB time comparison bisa simple, kita pakai nama hari bahasa Indonesia (opsional, jika jadwal mengikat hari)
+                # Mari kita update semua jadwal untuk lab tsb di waktu skr
+                cursor.execute(
+                    "UPDATE jadwal SET status = 'digunakan' WHERE lab = %s AND jam_mulai <= %s AND jam_selesai >= %s",
+                    (lab, now_str, now_str)
+                )
     
     logger.info(f"✅ Approve peminjaman ID: {pid}")
     return {"success": True, "message": "Peminjaman disetujui (Aktif)."}
@@ -778,6 +744,8 @@ def reject_peminjaman(pid: int) -> Dict:
             )
             if cursor.rowcount == 0:
                  return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+                 
+            # Note: No need to update jadwal status to digunakan on reject, it stays tersedia/menunggu.
     
     logger.warning(f"❌ Reject peminjaman ID: {pid}")
     return {"success": True, "message": "Peminjaman ditolak."}
@@ -816,6 +784,16 @@ def check_out(nim: str) -> Dict:
                 "UPDATE peminjaman SET waktu_keluar = %s, status = 'selesai' WHERE id = %s",
                 (now, active["id"])
             )
+            
+            # Revert lab schedule back to tersedia if there are no more active peminjaman for this lab
+            cursor.execute("SELECT COUNT(id) AS c FROM peminjaman WHERE lab = %s AND status = 'aktif'", (active["lab"],))
+            active_count = cursor.fetchone()
+            if active_count and active_count["c"] == 0:
+                now_time_str = datetime.now().strftime("%H:%M:%S")
+                cursor.execute(
+                    "UPDATE jadwal SET status = 'tersedia' WHERE lab = %s AND jam_mulai <= %s AND jam_selesai >= %s AND status = 'digunakan'",
+                    (active["lab"], now_time_str, now_time_str)
+                )
 
     durasi = _format_duration(waktu_masuk_str, now)
     logger.info(f"📤 Check-out: {nim} (durasi: {durasi})")

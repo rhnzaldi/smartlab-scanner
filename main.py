@@ -153,6 +153,7 @@ class SchedulePayload(BaseModel):
     jam_selesai: str
     tipe_semester: str
     tahun_ajaran: str
+    status: Optional[str] = "tersedia"
 
 
 @asynccontextmanager
@@ -622,6 +623,26 @@ async def api_status():
     }
 
 
+@app.get("/api/public/status")
+async def api_public_status():
+    """Public endpoint: status peminjaman aktif/meminta ACC."""
+    peminjaman_list = await asyncio.to_thread(get_active_peminjaman)
+    active = [p for p in peminjaman_list if p["status"] == "aktif"]
+    pending = [p for p in peminjaman_list if p["status"] == "menunggu"]
+    return {
+        "active_count": len(active),
+        "pending_count": len(pending),
+        "peminjaman": active,
+        "peminjaman_pending": pending
+    }
+
+
+@app.get("/api/public/jadwal")
+async def api_public_jadwal(archived: bool = False):
+    """Public endpoint: list jadwal laboratorium."""
+    return await asyncio.to_thread(get_jadwal, archived)
+
+
 # ────────────────────────────────────────────────────────
 # Lab Management Endpoints
 # ────────────────────────────────────────────────────────
@@ -702,6 +723,7 @@ async def api_create_jadwal(payload: SchedulePayload):
         payload.jam_selesai,
         payload.tipe_semester,
         payload.tahun_ajaran,
+        payload.status,
     )
 
 
@@ -721,6 +743,7 @@ async def api_update_jadwal(jadwal_id: int, payload: SchedulePayload):
         payload.jam_selesai,
         payload.tipe_semester,
         payload.tahun_ajaran,
+        payload.status,
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
