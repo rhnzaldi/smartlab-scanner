@@ -331,10 +331,7 @@ def augment_split(
     original_count = len(image_files)
     generated = 0
 
-    print(f"\n{'='*50}")
-    print(f"  Augmenting [{split_name}]: {original_count} images × {multiplier} = {original_count * multiplier} new images")
-    print(f"  Total setelah augmentasi: {original_count + original_count * multiplier} images")
-    print(f"{'='*50}")
+    print(f"\n⏳ [{split_name}] Augmenting {original_count} images × {multiplier}x ...", end="", flush=True)
 
     for img_path in image_files:
         # Load image
@@ -378,9 +375,12 @@ def augment_split(
             save_yolo_labels(aug_label_path, aug_labels)
             generated += 1
 
-        print(f"  ✅ {basename}: {multiplier} variants generated")
+        # Tampilkan titik setiap 10 gambar selesai diproses
+        idx = image_files.index(img_path) + 1
+        if idx % 10 == 0 or idx == original_count:
+            print(f" {idx}/{original_count}", end="", flush=True)
 
-    print(f"\n  📊 {split_name} SUMMARY: {original_count} originals + {generated} augmented = {original_count + generated} total")
+    print(f"\n✅ [{split_name}] {original_count} originals + {generated} augmented = {original_count + generated} total")
 
 
 def find_dataset_structure(dataset_path: str) -> dict:

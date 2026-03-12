@@ -106,7 +106,7 @@ class KTMPipeline:
     def __init__(
         self,
         model_path: str = "models/best.pt",
-        confidence_threshold: float = 0.35,
+        confidence_threshold: float = 0.50,   # dinaikkan dari 0.35 → model sudah 97%
         iou_threshold: float = 0.45,
         device: str = "cpu",
     ):
@@ -220,6 +220,7 @@ class KTMPipeline:
     ) -> Dict[str, Detection]:
         """
         Crop bounding box regions dari frame.
+        Ditambahkan Auto-Padding margin putih agar OCR tidak memotong huruf awal/akhir.
         Returns dict mapping label → Detection (with crop filled).
         Jika ada duplikat label, ambil yang confidence tertinggi.
         """
@@ -227,10 +228,22 @@ class KTMPipeline:
         crops: Dict[str, Detection] = {}
 
         for det in detections:
-            x1 = max(0, det.bbox[0])
-            y1 = max(0, det.bbox[1])
-            x2 = min(w, det.bbox[2])
-            y2 = min(h, det.bbox[3])
+            # Padding margins (dalam pixel)
+            # Teks butuh padding X lebih banyak agar kerning/huruf tepi masuk semua
+            pad_x_left, pad_x_right, pad_y = 0, 0, 0
+            
+            if det.label == "text_nim":
+                pad_x_left, pad_x_right, pad_y = 15, 30, 8
+            elif det.label == "text_nama":
+                pad_x_left, pad_x_right, pad_y = 15, 45, 10
+            elif det.label == "qr_code":
+                pad_x_left, pad_x_right, pad_y = 10, 10, 10
+
+            # Set kotak dengan padding (tidak boleh melebihi batas ukuran/resolusi gambar frame)
+            x1 = max(0, det.bbox[0] - pad_x_left)
+            y1 = max(0, det.bbox[1] - pad_y)
+            x2 = min(w, det.bbox[2] + pad_x_right)
+            y2 = min(h, det.bbox[3] + pad_y)
 
             if x2 - x1 < 5 or y2 - y1 < 5:
                 logger.warning(
@@ -292,12 +305,14 @@ class KTMPipeline:
         # ── Step 3 & 4: Extract QR Code ──
         if "qr_code" in crops and crops["qr_code"].crop is not None:
             qr_crop = crops["qr_code"].crop
-            # Preprocess untuk QR
-            qr_preprocessed = preprocess_for_qr(qr_crop)
-            qr_raw = extract_qr(qr_preprocessed)
+            # preprocess_for_qr hanya upscale + grayscale (tidak binary)
+            # Strategi binerisasi / CLAHE dilakukan di dalam extract_qr() sendiri
+            qr_preprocessed = preprocess_for_qr(qr_crop)   # upscale ke ≥200px
+            qr_raw = extract_qr(qr_preprocessed)            # 9 strategi decode
 
-            # Jika gagal, coba lagi dengan crop asli (tanpa preprocessing)
+            # Fallback: coba langsung dari raw BGR crop (siapa tahu lebih baik)
             if not qr_raw:
+                logger.debug("QR: preprocessed failed, retrying with raw color crop...")
                 qr_raw = extract_qr(qr_crop)
 
             if qr_raw:

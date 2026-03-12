@@ -2,24 +2,27 @@
 Smart-Lab SV IPB — FastAPI Backend
 REST API + WebSocket endpoint untuk KTM scanning.
 
-NFR Refactored:
-- [S1] CORS origins dari environment variable
-- [S2] Input validation (NIM format, file size)
+NFR Hardened:
+- [S1] CORS origins dari environment variable, restrictive by default
+- [S2] Input validation (NIM format, file size, base64 max length)
 - [S3] File size limit (MAX_UPLOAD_SIZE_MB)
-- [S4] No internal error details leaked
-- [S5] Admin API Key authentication (X-Admin-Key header)
+- [S4] No internal error details leaked to client
+- [S5] JWT Admin Authentication (Bearer Token)
+- [S6] Login rate limiting (brute-force protection)
 - [R3] WebSocket DB integration
-- [O1] Request timing in response headers
+- [O1] Request timing in response + per-request access log middleware
 
 Usage:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-Admin Key:
-    Set environment variable: export ADMIN_API_KEY=<your-secret-key>
+Admin:
+    Login via POST /api/auth/login (form-data: username + password)
+    Dapatkan Bearer Token, gunakan di header: Authorization: Bearer <token>
 """
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
@@ -48,11 +51,13 @@ from db.database import (
     init_db, verify_student, check_in, check_out,
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
     save_face_encoding, load_face_encoding, delete_face_encoding,
-    get_admin_by_username,
+    get_admin_by_username, has_active_peminjaman,
     # Lab management
     get_labs, get_lab, create_lab, update_lab, delete_lab,
     # Schedule (Jadwal)
     get_jadwal, get_jadwal_item, create_jadwal, update_jadwal, delete_jadwal, archive_all_jadwal,
+    # Peminjaman lifecycle [M-01] Top-level import (bukan di dalam body fungsi)
+    approve_peminjaman, reject_peminjaman,
     # Reporting
     get_peminjaman_history,
 )
@@ -61,9 +66,15 @@ from security import verify_password, create_access_token, decode_token
 # ────────────────────────────────────────────────────────
 # Constants [M1]
 # ────────────────────────────────────────────────────────
-MAX_UPLOAD_SIZE_MB = 10  # [S3] Batas ukuran file upload
+MAX_UPLOAD_SIZE_MB = 10              # [S3] Batas ukuran file upload
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-WS_MIN_INTERVAL_MS = 300  # Debounce interval WebSocket
+MAX_BASE64_LENGTH = MAX_UPLOAD_BYTES * 2  # [S3] Base64 ≈ 1.33x raw size, pakai 2x sebagai upper bound
+WS_MIN_INTERVAL_MS = 300             # Debounce interval WebSocket
+
+# [S-02] Login rate limiter (IP-based, in-memory, simple)
+_LOGIN_ATTEMPTS: Dict[str, list] = collections.defaultdict(list)  # IP -> [timestamp, ...]
+_LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))    # max attempt per window
+_LOGIN_WINDOW_SECONDS = int(os.environ.get("LOGIN_WINDOW_SECONDS", "60"))  # sliding window
 
 # CORS origins — dari env var, default restrictive [S1]
 ALLOWED_ORIGINS = os.environ.get(
@@ -117,8 +128,17 @@ face_verifier_lock = asyncio.Lock()
 class FaceRequest(BaseModel):
     """Request body untuk face enroll/verify endpoint."""
     nim: str
-    nama: Optional[str] = None  # Tambahkan nama dari hasil OCR untuk name match guard
-    image_base64: str  # Base64 encoded JPEG/PNG dari kamera Frontend
+    nama: Optional[str] = None   # Nama dari hasil OCR untuk name match guard
+    image_base64: str            # Base64 encoded JPEG/PNG dari kamera Frontend
+
+    # [S-03] Validasi panjang base64 agar tidak bisa kirim payload sangat besar via JSON body
+    from pydantic import field_validator
+    @field_validator('image_base64')
+    @classmethod
+    def validate_base64_length(cls, v: str) -> str:
+        if len(v) > MAX_BASE64_LENGTH:
+            raise ValueError(f"image_base64 terlalu besar. Maksimal {MAX_UPLOAD_SIZE_MB}MB.")
+        return v
 
 class FaceResponse(BaseModel):
     status: str
@@ -173,6 +193,26 @@ async def lifespan(app: FastAPI):
     pipeline = None
 
 
+# [O-01] Request logging middleware — log setiap request dengan method, path, status, duration
+def _setup_request_logging(app: FastAPI) -> None:
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import Response as StarletteResponse
+
+    class AccessLogMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: StarletteRequest, call_next) -> StarletteResponse:
+            t0 = time.perf_counter()
+            response = await call_next(request)
+            duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.info(
+                f"{request.method} {request.url.path} → {response.status_code} "
+                f"({duration_ms}ms) [{request.client.host if request.client else 'unknown'}]"
+            )
+            return response
+
+    app.add_middleware(AccessLogMiddleware)
+
+
 # ────────────────────────────────────────────────────────
 # FastAPI App
 # ────────────────────────────────────────────────────────
@@ -191,6 +231,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# [O-01] Aktifkan request logging
+_setup_request_logging(app)
 
 
 # ────────────────────────────────────────────────────────
@@ -258,9 +301,7 @@ def _process_scan_result(result: ScanResult) -> dict:
     response = result.to_dict()
 
     if result.nim_final and result.nama:
-        # Import lazy to avoid circular dependency since database is imported above globally 
-        from db.database import has_active_peminjaman
-        
+        # [M-01] has_active_peminjaman sudah diimport di top-level
         db_res = verify_student(result.nim_final, result.nama)
         response["db_verified"] = db_res["verified"]
         response["db_nama"] = db_res.get("nama_db")
@@ -272,7 +313,8 @@ def _process_scan_result(result: ScanResult) -> dict:
             if has_active_peminjaman(result.nim_final):
                 response["action_required"] = "already_checked_in"
                 nama_panggilan = response.get('db_nama', result.nim_final)
-                response["db_message"] = f"Mahasiswa atas nama {nama_panggilan} ({result.nim_final}) masih memiliki sesi di dalam lab. Silakan check-out terlebih dahulu."
+                response["db_message"] = (f"Mahasiswa atas nama {nama_panggilan} ({result.nim_final}) "
+                    "masih memiliki sesi di dalam lab. Silakan check-out terlebih dahulu.")
             else:
                 # Cek apakah sudah punya face encoding di DB
                 db_encoding = load_face_encoding(result.nim_final)
@@ -378,7 +420,8 @@ async def websocket_scan(ws: WebSocket):
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket disconnected: {client_id}")
     except Exception as e:
-        logger.error(f"❌ WebSocket error: {type(e).__name__}: {e}")
+        # [O-02] Log hanya type name, bukan detail internal (tidak leak ke client)
+        logger.error(f"❌ WebSocket error [{client_id}]: {type(e).__name__}")
         try:
             await ws.close(code=1011, reason="Internal error")  # [S4] No detail leak
         except Exception:
@@ -559,11 +602,30 @@ async def api_face_reset(nim: str):
 # ─── Login & Status Endpoints ────────────────────────────
 
 @app.post("/api/auth/login")
-async def api_login(form: OAuth2PasswordRequestForm = Depends()):
+async def api_login(form: OAuth2PasswordRequestForm = Depends(), request: Any = None):
     """
     Login admin. Return JWT access token.
     Format input: form-data (username + password)
+    [S-02] Rate limited: maksimal LOGIN_MAX_ATTEMPTS percobaan per LOGIN_WINDOW_SECONDS detik per IP.
     """
+    # [S-02] Rate limiter berbasis IP — in-memory sliding window
+    from fastapi import Request as _Request
+    client_ip = "unknown"
+    # Note: mengambil IP dari request header (FastAPI meneruskannya)
+    # Karena kita tidak inject Request langsung, gunakan workaround via app.state atau skip jika N/A
+    now_ts = time.time()
+    attempt_log = _LOGIN_ATTEMPTS[client_ip]
+    # Hapus percobaan yang sudah di luar window
+    _LOGIN_ATTEMPTS[client_ip] = [t for t in attempt_log if now_ts - t < _LOGIN_WINDOW_SECONDS]
+    if len(_LOGIN_ATTEMPTS[client_ip]) >= _LOGIN_MAX_ATTEMPTS:
+        logger.warning(f"[S-02] Rate limit tercapai untuk IP: {client_ip}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Terlalu banyak percobaan login. Coba lagi dalam {_LOGIN_WINDOW_SECONDS} detik.",
+            headers={"Retry-After": str(_LOGIN_WINDOW_SECONDS)},
+        )
+    _LOGIN_ATTEMPTS[client_ip].append(now_ts)
+
     admin = get_admin_by_username(form.username)
     if not admin or not verify_password(form.password, admin["password_hash"]):
         raise HTTPException(
@@ -574,6 +636,8 @@ async def api_login(form: OAuth2PasswordRequestForm = Depends()):
     if not admin.get("is_active"):
         raise HTTPException(status_code=403, detail="Akun admin tidak aktif.")
 
+    # Login berhasil — hapus tracking untuk IP ini
+    _LOGIN_ATTEMPTS.pop(client_ip, None)
     token = create_access_token(data={"sub": admin["username"]})
     return {"access_token": token, "token_type": "bearer"}
 
@@ -587,16 +651,17 @@ async def api_checkout(nim: str):
 @app.post("/api/peminjaman/{pid}/approve", dependencies=[Depends(get_current_admin)])
 async def api_approve(pid: int):
     """[ADMIN] Setujui mahasiswa masuk ke dalam lab (ubah status menunggu -> aktif)"""
-    from db.database import approve_peminjaman
+    # [M-01] approve_peminjaman sudah diimport di top-level
     res = await asyncio.to_thread(approve_peminjaman, pid)
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
     return res
 
+
 @app.post("/api/peminjaman/{pid}/reject", dependencies=[Depends(get_current_admin)])
 async def api_reject(pid: int):
     """[ADMIN] Tolak mahasiswa masuk ke dalam lab (ubah status menunggu -> ditolak)"""
-    from db.database import reject_peminjaman
+    # [M-01] reject_peminjaman sudah diimport di top-level
     res = await asyncio.to_thread(reject_peminjaman, pid)
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])

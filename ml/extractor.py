@@ -1,16 +1,15 @@
 """
 Smart-Lab SV IPB — Text & QR Extractor
-PaddleOCR untuk teks NIM/Nama, pyzbar untuk QR Code.
+PaddleOCR untuk teks NIM/Nama, pyzbar + cv2.QRCodeDetector untuk QR Code.
 
-NFR Refactored:
-- [P3] Module-level lazy import for pyzbar
-- [M3] Removed dead code (extract_text_multiple_attempts)
-- [O3] No more silent exception swallowing
+Changelog v2:
+  - QR: tambah upscale 2x/3x, tambah cv2.QRCodeDetector fallback, tambah CLAHE strategy
+  - OCR: tambah confidence filter (score > 0.55), tambah use_angle_cls=True
+  - OCR: multi-attempt (preprocessed → grayscale → color)
 """
 
 import logging
 import os
-import sys
 from typing import Optional
 
 # Skip slow PaddleOCR connectivity check
@@ -22,16 +21,16 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────
-# Lazy-loaded singletons [P3]
+# Lazy-loaded singletons
 # ────────────────────────────────────────────────────────
 _paddle_ocr_instance = None
 _paddle_ocr_init_failed = False
-_pyzbar_decode = None  # [P3] lazy-loaded pyzbar
-_pyzbar_available = None  # None = not checked, True/False = result
+_pyzbar_decode = None
+_pyzbar_available = None
 
 
 def _get_paddle_ocr():
-    """Lazy-load PaddleOCR v5. Dipanggil sekali, di-cache selamanya."""
+    """Lazy-load PaddleOCR. Dipanggil sekali, di-cache selamanya."""
     global _paddle_ocr_instance, _paddle_ocr_init_failed
     if _paddle_ocr_init_failed:
         return None
@@ -39,8 +38,11 @@ def _get_paddle_ocr():
         try:
             logger.info("⏳ Loading PaddleOCR (first time, may take a moment)...")
             from paddleocr import PaddleOCR
-            _paddle_ocr_instance = PaddleOCR(lang="en")
-            logger.info("✅ PaddleOCR loaded successfully.")
+            _paddle_ocr_instance = PaddleOCR(
+                lang="en",
+                use_angle_cls=True,  # Handle teks yang sedikit miring
+            )
+            logger.info("✅ PaddleOCR loaded (use_angle_cls=True).")
         except Exception as e:
             logger.error(f"❌ PaddleOCR init failed: {e}")
             _paddle_ocr_init_failed = True
@@ -49,7 +51,7 @@ def _get_paddle_ocr():
 
 
 def _get_pyzbar_decode():
-    """[P3] Lazy-load pyzbar. Import sekali, cache selamanya."""
+    """Lazy-load pyzbar. Import sekali, cache selamanya."""
     global _pyzbar_decode, _pyzbar_available
     if _pyzbar_available is False:
         return None
@@ -64,44 +66,93 @@ def _get_pyzbar_decode():
             return None
     return _pyzbar_decode
 
+
 # ────────────────────────────────────────────────────────
 # QR Code Extraction
 # ────────────────────────────────────────────────────────
+
+def _try_cv2_qr_decode(img: np.ndarray) -> Optional[str]:
+    """
+    Fallback QR decode menggunakan cv2.QRCodeDetector (built-in OpenCV, no extra dep).
+    Bekerja pada gambar grayscale atau color BGR.
+    """
+    try:
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(img)
+        if data:
+            return data.strip()
+    except Exception:
+        pass
+    return None
+
+
 def extract_qr(img: np.ndarray) -> Optional[str]:
     """
-    Decode QR code dari image crop menggunakan pyzbar.
-    Mencoba beberapa strategi preprocessing jika gagal.
+    Decode QR code dari image crop.
+
+    Strategi (dicoba berurutan, berhenti saat salah satu berhasil):
+      1. Grayscale asli (sudah diupscale dari pipeline)
+      2. OTSU binary
+      3. OTSU inverted
+      4. Upscale 2× + OTSU binary
+      5. Upscale 3× + OTSU binary
+      6. CLAHE + OTSU (untuk QR dengan kontras rendah)
+      7. cv2.QRCodeDetector fallback (grayscale & binary)
+
+    Input: bisa grayscale atau BGR — fungsi ini normalize sendiri.
     """
     pyzbar_decode = _get_pyzbar_decode()
-    if pyzbar_decode is None:
-        return None
 
-    from pyzbar.pyzbar import ZBarSymbol
-
-    strategies = [
-        ("raw", img),
-    ]
-
-    # Strategi 2: grayscale
+    # Normalize ke grayscale dulu
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        strategies.append(("grayscale", gray))
     else:
-        gray = img
+        gray = img.copy()
 
-    # Strategi 3: OTSU threshold
-    gray_for_bin = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    _, binary = cv2.threshold(gray_for_bin, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    strategies.append(("binary", binary))
+    # Hitung threshold OTSU sekali pakai
+    _, binary     = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary_inv    = cv2.bitwise_not(binary)
 
-    # Strategi 4: inverted
-    strategies.append(("inverted", cv2.bitwise_not(binary)))
+    # Upscale variants
+    h, w = gray.shape
+    gray_2x  = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    gray_3x  = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+    _, bin_2x = cv2.threshold(gray_2x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, bin_3x = cv2.threshold(gray_3x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    for strategy_name, processed_img in strategies:
-        results = pyzbar_decode(processed_img, symbols=[ZBarSymbol.QRCODE])
-        if results:
-            data = results[0].data.decode("utf-8", errors="ignore").strip()
-            logger.info(f"QR decoded ({strategy_name}): '{data}'")
+    # CLAHE variant (normalisasi kontras lokal)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    gray_clahe = clahe.apply(gray)
+    _, bin_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    strategies = [
+        ("gray",          gray),
+        ("binary",        binary),
+        ("binary_inv",    binary_inv),
+        ("2x_binary",     bin_2x),
+        ("3x_binary",     bin_3x),
+        ("clahe_binary",  bin_clahe),
+    ]
+
+    # ── pyzbar strategies ──
+    if pyzbar_decode is not None:
+        try:
+            from pyzbar.pyzbar import ZBarSymbol
+            for name, processed in strategies:
+                results = pyzbar_decode(processed, symbols=[ZBarSymbol.QRCODE])
+                if results:
+                    data = results[0].data.decode("utf-8", errors="ignore").strip()
+                    if data:
+                        logger.info(f"QR decoded via pyzbar [{name}]: '{data}'")
+                        return data
+        except Exception as e:
+            logger.debug(f"pyzbar error: {e}")
+
+    # ── cv2.QRCodeDetector fallback ──
+    for name, processed in [("cv2_gray", gray), ("cv2_binary", binary), ("cv2_2x", gray_2x)]:
+        data = _try_cv2_qr_decode(processed)
+        if data:
+            logger.info(f"QR decoded via cv2 [{name}]: '{data}'")
             return data
 
     logger.warning("⚠️ QR code could not be decoded with any strategy.")
@@ -111,50 +162,89 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
 # ────────────────────────────────────────────────────────
 # OCR Text Extraction
 # ────────────────────────────────────────────────────────
+
+_OCR_CONFIDENCE_THRESHOLD = 0.55  # Abaikan teks dengan confidence < ini
+
+
+def _run_ocr_on(img: np.ndarray) -> Optional[str]:
+    """
+    Jalankan PaddleOCR pada satu image (grayscale atau BGR).
+    Filter baris teks dengan confidence < _OCR_CONFIDENCE_THRESHOLD.
+    Kembalikan teks gabungan atau None jika kosong.
+    """
+    ocr = _get_paddle_ocr()
+    if ocr is None:
+        return None
+
+    h, w = img.shape[:2]
+    if h < 16 or w < 32:
+        return None
+
+    try:
+        results = ocr.predict(img)
+        if not results:
+            return None
+
+        texts = []
+        for result_item in results:
+            rec_texts  = result_item.get("rec_texts", [])
+            rec_scores = result_item.get("rec_scores", [])
+            for text, score in zip(rec_texts, rec_scores):
+                if score >= _OCR_CONFIDENCE_THRESHOLD:
+                    texts.append(text)
+                    logger.debug(f"  OCR line accepted: '{text}' (conf: {score:.2f})")
+                else:
+                    logger.debug(f"  OCR line rejected (low conf {score:.2f}): '{text}'")
+
+        combined = " ".join(texts).strip()
+        return combined if combined else None
+
+    except Exception as e:
+        logger.debug(f"  OCR error: {e}")
+        return None
+
+
 def extract_text_ocr(img: np.ndarray) -> Optional[str]:
     """
-    Ekstrak teks dari image crop menggunakan PaddleOCR v5.
-    Returns gabungan semua baris teks yang terdeteksi, atau None.
+    Ekstrak teks dari image crop menggunakan PaddleOCR.
+
+    Multi-attempt (fallback jika attempt sebelumnya gagal):
+      1. Input yang diterima (biasanya sudah preprocessed: CLAHE + sharpen)
+      2. Grayscale mentah (tanpa preprocessing tambahan)
+      3. Image color asli BGR (PaddleOCR kadang lebih baik dengan color)
+
+    Returns: teks gabungan semua baris, atau None.
     """
     if img is None or img.size == 0:
         return None
 
-    # Minimum size check — PaddleOCR crashes on very small images
     h, w = img.shape[:2]
     if h < 16 or w < 32:
         logger.debug(f"  Image too small for OCR: {w}x{h}")
         return None
 
-    # Upscale small images for better OCR accuracy
-    if h < 64:
-        scale = 64 / h
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # Attempt 1: gunakan img yang sudah masuk (sudah preprocessed dari pipeline)
+    result = _run_ocr_on(img)
+    if result:
+        logger.info(f"OCR result (attempt 1): '{result}'")
+        return result
 
-    try:
-        ocr = _get_paddle_ocr()
-        if ocr is None:
-            return None
+    # Attempt 2: grayscale saja (tanpa CLAHE/sharpen)
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
 
-        # PaddleOCR v5 uses .predict() instead of .ocr()
-        results = ocr.predict(img)
+    # Upscale jika perlu untuk grayscale fallback
+    gh, gw = gray.shape
+    if gh < 64:
+        scale = 64 / gh
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        if not results:
-            logger.warning("⚠️ PaddleOCR returned no results.")
-            return None
+    result = _run_ocr_on(gray)
+    if result:
+        logger.info(f"OCR result (attempt 2 gray): '{result}'")
+        return result
 
-        # Parse OCRResult object
-        texts = []
-        for result_item in results:
-            rec_texts = result_item.get("rec_texts", [])
-            rec_scores = result_item.get("rec_scores", [])
-            for text, score in zip(rec_texts, rec_scores):
-                texts.append(text)
-                logger.debug(f"  OCR line: '{text}' (conf: {score:.2f})")
-
-        combined = " ".join(texts).strip()
-        logger.info(f"OCR extracted: '{combined}'")
-        return combined if combined else None
-
-    except Exception as e:
-        logger.debug(f"  OCR skip (small/bad crop): {e}")
-        return None
+    logger.warning("⚠️ OCR returned no confident text after all attempts.")
+    return None

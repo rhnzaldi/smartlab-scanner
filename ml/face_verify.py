@@ -22,6 +22,17 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# [R-01] Top-level import antispoof — jangan import di dalam method body
+# Ini mencegah ImportError runtime yang sulit di-debug
+try:
+    from .antispoof import detector as _liveness_detector
+    _antispoof_available = True
+except ImportError as e:
+    logger.error(f"❌ Antispoof module gagal dimuat: {e}")
+    _liveness_detector = None
+    _antispoof_available = False
+
+
 # ────────────────────────────────────────────────────────
 # Lazy-load InsightFace
 # ────────────────────────────────────────────────────────
@@ -59,6 +70,7 @@ def _get_face_app():
 # Constants
 # ────────────────────────────────────────────────────────
 FACE_MATCH_THRESHOLD = 0.5   # ≥50% similarity = cocok, <50% = DITOLAK
+_BORDER_MARGIN_PX = 10       # Deadzone piksel dari tepi frame
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -68,6 +80,17 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if norm == 0:
         return 0.0
     return float(dot / norm)
+
+
+def _check_liveness(face_crop: np.ndarray) -> dict:
+    """
+    Jalankan liveness check. Return default 'real' jika antispoof tidak tersedia.
+    Memisahkan liveness logic dari enroll/verify untuk DRY [M-REF].
+    """
+    if not _antispoof_available or _liveness_detector is None:
+        logger.warning("⚠️ Antispoof tidak tersedia, liveness check dilewati.")
+        return {"is_real": True, "message": "Antispoof N/A", "fail_count": 0}
+    return _liveness_detector.analyze_liveness(face_crop)
 
 
 class FaceVerifier:
@@ -120,29 +143,34 @@ class FaceVerifier:
 
         largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         x1, y1, x2, y2 = [int(v) for v in largest.bbox]
-        h, w = live_frame.shape[:2]
+        h, w = live_frame.shape[:2]  # [DEAD CODE FIX] Hanya deklarasi satu kali
 
         # --- BORDER CONSTRAINT ---
         # Cegah pendaftaran wajah jika sebagian wajah terpotong layar
-        margin = 10  # 10 pixels deadzone
-        if x1 < margin or y1 < margin or x2 > (w - margin) or y2 > (h - margin):
+        if x1 < _BORDER_MARGIN_PX or y1 < _BORDER_MARGIN_PX or x2 > (w - _BORDER_MARGIN_PX) or y2 > (h - _BORDER_MARGIN_PX):
             result["message"] = "Wajah terpotong batas layar. Mundur sedikit ke tengah."
-            # Reject immediately
             return result
 
-        # --- LIVENESS DETECTION (ANTI-SPOOFING) ---
-        from .antispoof import detector
-        h, w = live_frame.shape[:2]
+        # --- LIVENESS DETECTION (ANTI-SPOOFING) --- [R-01] Gunakan helper + top-level import
         cx1, cy1 = max(0, x1), max(0, y1)
         cx2, cy2 = min(w, x2), min(h, y2)
-        
+
         if cx2 > cx1 and cy2 > cy1:
             face_crop = live_frame[cy1:cy2, cx1:cx2]
-            liveness = detector.analyze_liveness(face_crop)
+            liveness = _check_liveness(face_crop)
             if not liveness["is_real"]:
-                result["message"] = f"Akses Ditolak: Terindikasi Gambar Palsu / Layar HP ({liveness['message']})"
+                fail_n = liveness.get("fail_count", "?")
+                result["message"] = (
+                    f"Akses Ditolak: Wajah Palsu Terdeteksi [{fail_n}/3 sinyal gagal] "
+                    f"— {liveness['message']}"
+                )
                 result["spoof_detected"] = True
-                logger.warning(f"Spoofing Rejection during Enrollment: {liveness}")
+                logger.warning(
+                    f"[Enroll] Spoofing rejected | "
+                    f"Blur={liveness.get('score_blur',0):.1f} "
+                    f"Glare={liveness.get('score_glare',0):.3f} "
+                    f"Tex={liveness.get('score_texture',0):.2f}"
+                )
                 return result
 
         result["face_detected"] = True
@@ -187,28 +215,33 @@ class FaceVerifier:
         # Largest face
         largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         x1, y1, x2, y2 = [int(v) for v in largest.bbox]
-        h, w = live_frame.shape[:2]
+        h, w = live_frame.shape[:2]  # [DEAD CODE FIX] Hanya deklarasi satu kali
 
         # --- BORDER CONSTRAINT ---
-        margin = 10
-        if x1 < margin or y1 < margin or x2 > (w - margin) or y2 > (h - margin):
-            # Biarkan InsightFace lanjut mencocokkan? TIDAK, kita keras.
+        if x1 < _BORDER_MARGIN_PX or y1 < _BORDER_MARGIN_PX or x2 > (w - _BORDER_MARGIN_PX) or y2 > (h - _BORDER_MARGIN_PX):
             result["message"] = "Wajah terpotong batas layar. Mundur sedikit ke tengah."
             return result
 
-        # --- LIVENESS DETECTION (ANTI-SPOOFING) ---
-        from .antispoof import detector
-        h, w = live_frame.shape[:2]
+        # --- LIVENESS DETECTION (ANTI-SPOOFING) --- [R-01] Gunakan helper + top-level import
         cx1, cy1 = max(0, x1), max(0, y1)
         cx2, cy2 = min(w, x2), min(h, y2)
-        
+
         if cx2 > cx1 and cy2 > cy1:
             face_crop = live_frame[cy1:cy2, cx1:cx2]
-            liveness = detector.analyze_liveness(face_crop)
+            liveness = _check_liveness(face_crop)
             if not liveness["is_real"]:
-                result["message"] = f"Akses Ditolak: Terindikasi Gambar Palsu / Layar HP ({liveness['message']})"
+                fail_n = liveness.get("fail_count", "?")
+                result["message"] = (
+                    f"Akses Ditolak: Wajah Palsu Terdeteksi [{fail_n}/3 sinyal gagal] "
+                    f"— {liveness['message']}"
+                )
                 result["spoof_detected"] = True
-                logger.warning(f"Spoofing Rejection: {liveness}")
+                logger.warning(
+                    f"[Verify] Spoofing rejected | "
+                    f"Blur={liveness.get('score_blur',0):.1f} "
+                    f"Glare={liveness.get('score_glare',0):.3f} "
+                    f"Tex={liveness.get('score_texture',0):.2f}"
+                )
                 return result
 
         result["face_detected"] = True

@@ -843,8 +843,16 @@ def get_peminjaman_history(
     year: Optional[int] = None,
     month: Optional[int] = None,
     prodi: Optional[str] = None,
+    include_active: bool = False,
 ) -> List[Dict]:
-    """Ambil riwayat peminjaman (peminjaman selesai/ditolak) dengan filter opsional."""
+    """Ambil riwayat peminjaman dengan filter opsional.
+
+    Args:
+        year: Filter tahun (opsional).
+        month: Filter bulan (opsional).
+        prodi: Filter program studi (opsional).
+        include_active: Jika True, sertakan peminjaman aktif/menunggu. Default False.
+    """
     with get_connection() as conn:
         with conn.cursor() as cursor:
             query = """
@@ -852,8 +860,12 @@ def get_peminjaman_history(
                 FROM peminjaman p
                 LEFT JOIN mahasiswa m ON p.nim = m.nim
             """
-            conditions = []
+            conditions: List[str] = []
             params: List[Any] = []
+
+            # [P-03] Default filter: hanya tampilkan selesai/ditolak (history murni)
+            if not include_active:
+                conditions.append("p.status IN ('selesai', 'ditolak')")
 
             if year is not None:
                 conditions.append("YEAR(p.waktu_masuk) = %s")
@@ -918,14 +930,18 @@ def load_face_encoding(nim: str) -> Optional[np.ndarray]:
 
 @_timed_db_op
 def has_face_encoding(nim: str) -> bool:
-    """Check apakah mahasiswa sudah punya face encoding."""
+    """Check apakah mahasiswa sudah punya face encoding.
+
+    [P-03] Menggunakan SELECT 1 + IS NOT NULL — tidak fetch LONGBLOB (~2KB) hanya
+    untuk cek existence. Jauh lebih efisien.
+    """
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT face_encoding FROM mahasiswa WHERE nim = %s", (nim,)
+                "SELECT 1 FROM mahasiswa WHERE nim = %s AND face_encoding IS NOT NULL",
+                (nim,)
             )
-            row = cursor.fetchone()
-    return row is not None and row["face_encoding"] is not None
+            return cursor.fetchone() is not None
 
 
 @_timed_db_op
