@@ -48,3 +48,10 @@ captures/
 
 # ── Gemini/Agent artifacts ──
 .gemini/
+
+# ── Serena (MCP agent tool) ──
+.serena/
+
+# ── Catatan lokal (tidak untuk repo) ──
+*.md.local
+aturan pengingat*.md

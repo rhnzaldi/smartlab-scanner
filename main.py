@@ -35,11 +35,11 @@ from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 load_dotenv()
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -51,7 +51,7 @@ from db.database import (
     init_db, verify_student, check_in, check_out,
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
     save_face_encoding, load_face_encoding, delete_face_encoding,
-    get_admin_by_username, has_active_peminjaman,
+    get_admin_by_username, has_active_peminjaman, has_face_encoding,
     # Lab management
     get_labs, get_lab, create_lab, update_lab, delete_lab,
     # Schedule (Jadwal)
@@ -132,7 +132,6 @@ class FaceRequest(BaseModel):
     image_base64: str            # Base64 encoded JPEG/PNG dari kamera Frontend
 
     # [S-03] Validasi panjang base64 agar tidak bisa kirim payload sangat besar via JSON body
-    from pydantic import field_validator
     @field_validator('image_base64')
     @classmethod
     def validate_base64_length(cls, v: str) -> str:
@@ -179,7 +178,7 @@ class SchedulePayload(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize ML pipeline on startup, cleanup on shutdown."""
-    global pipeline
+    global pipeline, face_verifier
     logger.info("🚀 Starting Smart-Lab ML Engine...")
     init_db()
     logger.info("✅ Database ready")
@@ -188,9 +187,14 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Pipeline ready!")
     else:
         logger.warning("⚠️ Pipeline loaded but model NOT FOUND. Will return empty results.")
+    # [MINOR-03] Inisialisasi FaceVerifier di startup — hindari race condition lazy-init
+    logger.info("🔧 Inisialisasi FaceVerifier (InsightFace)...")
+    face_verifier = FaceVerifier()
+    logger.info("✅ FaceVerifier ready.")
     yield
     logger.info("🛑 Shutting down Smart-Lab ML Engine.")
     pipeline = None
+    face_verifier = None
 
 
 # [O-01] Request logging middleware — log setiap request dengan method, path, status, duration
@@ -316,10 +320,10 @@ def _process_scan_result(result: ScanResult) -> dict:
                 response["db_message"] = (f"Mahasiswa atas nama {nama_panggilan} ({result.nim_final}) "
                     "masih memiliki sesi di dalam lab. Silakan check-out terlebih dahulu.")
             else:
-                # Cek apakah sudah punya face encoding di DB
-                db_encoding = load_face_encoding(result.nim_final)
+                # [Optimasi] Gunakan has_face_encoding (SELECT 1) bukan load_face_encoding
+                # agar tidak fetch LONGBLOB ~2KB hanya untuk cek existence
                 response["action_required"] = (
-                    "face_verify" if db_encoding is not None else "face_enroll"
+                    "face_verify" if has_face_encoding(result.nim_final) else "face_enroll"
                 )
 
     return response
@@ -602,17 +606,18 @@ async def api_face_reset(nim: str):
 # ─── Login & Status Endpoints ────────────────────────────
 
 @app.post("/api/auth/login")
-async def api_login(form: OAuth2PasswordRequestForm = Depends(), request: Any = None):
+async def api_login(
+    request: Request,
+    form: OAuth2PasswordRequestForm = Depends(),
+):
     """
     Login admin. Return JWT access token.
     Format input: form-data (username + password)
     [S-02] Rate limited: maksimal LOGIN_MAX_ATTEMPTS percobaan per LOGIN_WINDOW_SECONDS detik per IP.
     """
     # [S-02] Rate limiter berbasis IP — in-memory sliding window
-    from fastapi import Request as _Request
-    client_ip = "unknown"
-    # Note: mengambil IP dari request header (FastAPI meneruskannya)
-    # Karena kita tidak inject Request langsung, gunakan workaround via app.state atau skip jika N/A
+    # [BUG-01 FIX] Ambil IP dari Request object yang di-inject FastAPI
+    client_ip = request.client.host if request.client else "unknown"
     now_ts = time.time()
     attempt_log = _LOGIN_ATTEMPTS[client_ip]
     # Hapus percobaan yang sudah di luar window

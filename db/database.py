@@ -30,17 +30,31 @@ from dbutils.pooled_db import PooledDB
 
 # ────────────────────────────────────────────────────────
 # Constants [M1]
-# ────────────────────────────────────────────────────────
-DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
+# ─── Konstanta & Helper ─────────────────────────────────
+DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "3306"))
 DB_USER = os.environ.get("DB_USER", "root")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 DB_NAME = os.environ.get("DB_NAME", "smartlab_db")
 
-NAME_MATCH_THRESHOLD = 0.5       # minimum similarity untuk fuzzy name match
+NAME_MATCH_THRESHOLD = float(os.environ.get("NAME_MATCH_THRESHOLD", "0.75"))
 NIM_PATTERN = r"^J[A-Z0-9]{6,12}$"  # valid NIM format untuk input validation [S2]
-DEFAULT_LAB = "Lab Smart-Lab"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+DEFAULT_LAB = os.environ.get("DEFAULT_LAB", "Laboratorium Komputer")
+
+# Nama hari Indonesia (untuk sinkronisasi jadwal)
+_HARI_INDONESIA = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+
+
+def _timedelta_to_hhmm(val) -> str:
+    """
+    [DUP-01] Helper: konversi MySQL timedelta / string ke format HH:MM.
+    Menggantikan duplikasi formatter yang sebelumnya tersebar di 3 tempat.
+    """
+    s = str(val)
+    if len(s) == 7:   # "H:MM:SS" → pad jadi "HH:MM:SS"
+        s = "0" + s
+    return s[:5] if len(s) >= 5 else s
 
 
 # ────────────────────────────────────────────────────────
@@ -168,7 +182,8 @@ def init_db():
                     "admin@smartlab.id",
                     get_password_hash("admin123"),
                 ))
-                logger.info("✅ Seed admin: username=admin, password=admin123")
+                # [SEED-01 FIX] Tidak log password ke output
+                logger.info("✅ Seed admin dibuat. Ganti password segera via /api/auth/login.")
 
             # Tabel labs (untuk manajemen laboratorium)
             cursor.execute("""
@@ -259,13 +274,10 @@ def get_labs() -> List[Dict]:
                 lab["equipment"] = json.loads(lab["equipment"])
             except Exception:
                 lab["equipment"] = []
-                
-        # Format timedelta properly to HH:MM
+        # [DUP-01] Gunakan helper _timedelta_to_hhmm()
         for key in ["op_start", "op_end", "use_start", "use_end"]:
             if lab.get(key) is not None:
-                s = str(lab[key])
-                if len(s) == 7: s = "0" + s
-                lab[key] = s[:5] if len(s) >= 5 else s
+                lab[key] = _timedelta_to_hhmm(lab[key])
     
     return labs
 
@@ -286,13 +298,10 @@ def get_lab(lab_id: int) -> Optional[Dict]:
             lab["equipment"] = json.loads(lab["equipment"])
         except Exception:
             lab["equipment"] = []
-            
-    # Format timedelta properly to HH:MM
+    # [DUP-01] Gunakan helper _timedelta_to_hhmm()
     for key in ["op_start", "op_end", "use_start", "use_end"]:
         if lab.get(key) is not None:
-            s = str(lab[key])
-            if len(s) == 7: s = "0" + s
-            lab[key] = s[:5] if len(s) >= 5 else s
+            lab[key] = _timedelta_to_hhmm(lab[key])
 
     return lab
 
@@ -404,14 +413,11 @@ def get_jadwal(include_archived: bool = False) -> List[Dict]:
             jadwal_list = cursor.fetchall()
 
     for jadwal in jadwal_list:
+        # [DUP-01] Gunakan helper _timedelta_to_hhmm()
         if jadwal.get("jam_mulai") is not None:
-            s = str(jadwal["jam_mulai"])
-            if len(s) == 7: s = "0" + s
-            jadwal["jam_mulai"] = s[:5] if len(s) >= 5 else s
+            jadwal["jam_mulai"] = _timedelta_to_hhmm(jadwal["jam_mulai"])
         if jadwal.get("jam_selesai") is not None:
-            s = str(jadwal["jam_selesai"])
-            if len(s) == 7: s = "0" + s
-            jadwal["jam_selesai"] = s[:5] if len(s) >= 5 else s
+            jadwal["jam_selesai"] = _timedelta_to_hhmm(jadwal["jam_selesai"])
 
     return jadwal_list
 
@@ -425,14 +431,11 @@ def get_jadwal_item(jadwal_id: int) -> Optional[Dict]:
             jadwal = cursor.fetchone()
 
     if jadwal:
+        # [DUP-01] Gunakan helper _timedelta_to_hhmm()
         if jadwal.get("jam_mulai") is not None:
-            s = str(jadwal["jam_mulai"])
-            if len(s) == 7: s = "0" + s
-            jadwal["jam_mulai"] = s[:5] if len(s) >= 5 else s
+            jadwal["jam_mulai"] = _timedelta_to_hhmm(jadwal["jam_mulai"])
         if jadwal.get("jam_selesai") is not None:
-            s = str(jadwal["jam_selesai"])
-            if len(s) == 7: s = "0" + s
-            jadwal["jam_selesai"] = s[:5] if len(s) >= 5 else s
+            jadwal["jam_selesai"] = _timedelta_to_hhmm(jadwal["jam_selesai"])
 
     return jadwal
 
@@ -720,13 +723,12 @@ def approve_peminjaman(pid: int) -> Dict:
             lab_res = cursor.fetchone()
             if lab_res:
                 lab = lab_res["lab"]
-                # Coba temukan jadwal aktif saat ini untuk lab tersebut dan tandai digunakan
+                # [JADWAL-01 FIX] Filter hari agar tidak update jadwal di hari yang salah
                 now_str = datetime.now().strftime("%H:%M:%S")
-                # Karena MariaDB time comparison bisa simple, kita pakai nama hari bahasa Indonesia (opsional, jika jadwal mengikat hari)
-                # Mari kita update semua jadwal untuk lab tsb di waktu skr
+                hari_ini = _HARI_INDONESIA[datetime.now().weekday()]
                 cursor.execute(
-                    "UPDATE jadwal SET status = 'digunakan' WHERE lab = %s AND jam_mulai <= %s AND jam_selesai >= %s",
-                    (lab, now_str, now_str)
+                    "UPDATE jadwal SET status = 'digunakan' WHERE lab = %s AND hari = %s AND jam_mulai <= %s AND jam_selesai >= %s",
+                    (lab, hari_ini, now_str, now_str)
                 )
     
     logger.info(f"✅ Approve peminjaman ID: {pid}")
@@ -790,9 +792,11 @@ def check_out(nim: str) -> Dict:
             active_count = cursor.fetchone()
             if active_count and active_count["c"] == 0:
                 now_time_str = datetime.now().strftime("%H:%M:%S")
+                # [JADWAL-01 FIX] Filter hari agar tidak revert jadwal di hari yang salah
+                hari_ini = _HARI_INDONESIA[datetime.now().weekday()]
                 cursor.execute(
-                    "UPDATE jadwal SET status = 'tersedia' WHERE lab = %s AND jam_mulai <= %s AND jam_selesai >= %s AND status = 'digunakan'",
-                    (active["lab"], now_time_str, now_time_str)
+                    "UPDATE jadwal SET status = 'tersedia' WHERE lab = %s AND hari = %s AND jam_mulai <= %s AND jam_selesai >= %s AND status = 'digunakan'",
+                    (active["lab"], hari_ini, now_time_str, now_time_str)
                 )
 
     durasi = _format_duration(waktu_masuk_str, now)
