@@ -1,109 +1,43 @@
 """
 Smart-Lab SV IPB — FastAPI Backend
 REST API + WebSocket endpoint untuk KTM scanning.
-
-NFR Hardened:
-- [S1] CORS origins dari environment variable, restrictive by default
-- [S2] Input validation (NIM format, file size, base64 max length)
-- [S3] File size limit (MAX_UPLOAD_SIZE_MB)
-- [S4] No internal error details leaked to client
-- [S5] JWT Admin Authentication (Bearer Token)
-- [S6] Login rate limiting (brute-force protection)
-- [R3] WebSocket DB integration
-- [O1] Request timing in response + per-request access log middleware
-
-Usage:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-Admin:
-    Login via POST /api/auth/login (form-data: username + password)
-    Dapatkan Bearer Token, gunakan di header: Authorization: Bearer <token>
 """
 
 import asyncio
 import base64
-import collections
 import json
 import logging
 import os
 import re
 import time
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
-
-# Load .env file sebelum import db/ (agar DB_HOST, DB_USER, dll tersedia)
-from dotenv import load_dotenv
-load_dotenv()
-
-from pydantic import BaseModel, field_validator
+from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError
+# --- PENAMBAHAN IMPORT ---
+from pydantic import BaseModel
 
 from ml.pipeline import KTMPipeline, ScanResult
-from ml.face_verify import FaceVerifier
 from db.database import (
     init_db, verify_student, check_in, check_out,
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
-    save_face_encoding, load_face_encoding, delete_face_encoding,
-    get_admin_by_username, has_active_peminjaman, has_face_encoding,
-    # Lab management
-    get_labs, get_lab, create_lab, update_lab, delete_lab,
-    # Schedule (Jadwal)
-    get_jadwal, get_jadwal_item, create_jadwal, update_jadwal, delete_jadwal, archive_all_jadwal,
-    # Peminjaman lifecycle [M-01] Top-level import (bukan di dalam body fungsi)
-    approve_peminjaman, reject_peminjaman,
-    # Reporting
-    get_peminjaman_history,
 )
-from security import verify_password, create_access_token, decode_token
 
 # ────────────────────────────────────────────────────────
 # Constants [M1]
 # ────────────────────────────────────────────────────────
-MAX_UPLOAD_SIZE_MB = 10              # [S3] Batas ukuran file upload
+MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-MAX_BASE64_LENGTH = MAX_UPLOAD_BYTES * 2  # [S3] Base64 ≈ 1.33x raw size, pakai 2x sebagai upper bound
-WS_MIN_INTERVAL_MS = 300             # Debounce interval WebSocket
+WS_MIN_INTERVAL_MS = 300
 
-# [S-02] Login rate limiter (IP-based, in-memory, simple)
-_LOGIN_ATTEMPTS: Dict[str, list] = collections.defaultdict(list)  # IP -> [timestamp, ...]
-_LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))    # max attempt per window
-_LOGIN_WINDOW_SECONDS = int(os.environ.get("LOGIN_WINDOW_SECONDS", "60"))  # sliding window
-
-# CORS origins — dari env var, default restrictive [S1]
 ALLOWED_ORIGINS = os.environ.get(
     "CORS_ORIGINS",
     "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
 ).split(",")
-
-# ─── JWT Auth (menggantikan ADMIN_API_KEY) ───────────────
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
-
-async def get_current_admin(token: str = Depends(oauth2_scheme)):
-    """
-    JWT Dependency Guard untuk endpoint admin.
-    Verifikasi Bearer token dari header Authorization.
-    """
-    try:
-        payload = decode_token(token)
-        username: str = payload.get("sub")
-        if not username:
-            raise HTTPException(status_code=401, detail="Token tidak valid.")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token tidak valid atau kedaluwarsa.")
-
-    admin = get_admin_by_username(username)
-    if not admin or not admin.get("is_active"):
-        raise HTTPException(status_code=401, detail="Akun admin tidak aktif atau tidak ditemukan.")
-    return admin
-
 
 # ────────────────────────────────────────────────────────
 # Logging
@@ -114,71 +48,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("smartlab-api")
 
+# --- PENAMBAHAN SCHEMA LOGIN ---
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 # ────────────────────────────────────────────────────────
 # Global pipeline (singleton)
 # ────────────────────────────────────────────────────────
 pipeline: Optional[KTMPipeline] = None
-face_verifier: Optional[FaceVerifier] = None
-face_verifier_lock = asyncio.Lock()
-
-
-# ────────────────────────────────────────────────────────
-# Pydantic Schemas (fastapi-pro: API contract first)
-# ────────────────────────────────────────────────────────
-class FaceRequest(BaseModel):
-    """Request body untuk face enroll/verify endpoint."""
-    nim: str
-    nama: Optional[str] = None   # Nama dari hasil OCR untuk name match guard
-    image_base64: str            # Base64 encoded JPEG/PNG dari kamera Frontend
-
-    # [S-03] Validasi panjang base64 agar tidak bisa kirim payload sangat besar via JSON body
-    @field_validator('image_base64')
-    @classmethod
-    def validate_base64_length(cls, v: str) -> str:
-        if len(v) > MAX_BASE64_LENGTH:
-            raise ValueError(f"image_base64 terlalu besar. Maksimal {MAX_UPLOAD_SIZE_MB}MB.")
-        return v
-
-class FaceResponse(BaseModel):
-    status: str
-    nim: Optional[str] = None
-    nama: Optional[str] = None
-    similarity: Optional[float] = None
-    message: Optional[str] = None
-    checkin: Optional[Dict[str, Any]] = None
-    processing_time_ms: float
-
-
-class LabPayload(BaseModel):
-    name: str
-    location: str
-    capacity: int
-    op_start: str
-    op_end: str
-    use_start: str
-    use_end: str
-    equipment: Optional[list[str]] = []
-    status_override: Optional[str] = None
-
-
-class SchedulePayload(BaseModel):
-    mata_kuliah: str
-    kelas: str
-    prodi: str
-    lab: str
-    gedung: str
-    hari: str
-    jam_mulai: str
-    jam_selesai: str
-    tipe_semester: str
-    tahun_ajaran: str
-    status: Optional[str] = "tersedia"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize ML pipeline on startup, cleanup on shutdown."""
-    global pipeline, face_verifier
+    global pipeline
     logger.info("🚀 Starting Smart-Lab ML Engine...")
     init_db()
     logger.info("✅ Database ready")
@@ -186,35 +72,10 @@ async def lifespan(app: FastAPI):
     if pipeline.is_ready():
         logger.info("✅ Pipeline ready!")
     else:
-        logger.warning("⚠️ Pipeline loaded but model NOT FOUND. Will return empty results.")
-    # [MINOR-03] Inisialisasi FaceVerifier di startup — hindari race condition lazy-init
-    logger.info("🔧 Inisialisasi FaceVerifier (InsightFace)...")
-    face_verifier = FaceVerifier()
-    logger.info("✅ FaceVerifier ready.")
+        logger.warning("⚠️ Pipeline loaded but model NOT FOUND.")
     yield
     logger.info("🛑 Shutting down Smart-Lab ML Engine.")
     pipeline = None
-    face_verifier = None
-
-
-# [O-01] Request logging middleware — log setiap request dengan method, path, status, duration
-def _setup_request_logging(app: FastAPI) -> None:
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request as StarletteRequest
-    from starlette.responses import Response as StarletteResponse
-
-    class AccessLogMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: StarletteRequest, call_next) -> StarletteResponse:
-            t0 = time.perf_counter()
-            response = await call_next(request)
-            duration_ms = round((time.perf_counter() - t0) * 1000, 1)
-            logger.info(
-                f"{request.method} {request.url.path} → {response.status_code} "
-                f"({duration_ms}ms) [{request.client.host if request.client else 'unknown'}]"
-            )
-            return response
-
-    app.add_middleware(AccessLogMiddleware)
 
 
 # ────────────────────────────────────────────────────────
@@ -227,85 +88,89 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — restrictive by default [S1]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# [O-01] Aktifkan request logging
-_setup_request_logging(app)
+# ────────────────────────────────────────────────────────
+# AUTH ENDPOINT (NEWly Added)
+# ────────────────────────────────────────────────────────
+
+
+@app.post("/auth/login")
+async def login(data: LoginRequest):
+    """
+    Endpoint Login untuk Admin & Mahasiswa.
+    """
+    logger.info(f"🔑 Login attempt for: {data.username}")
+
+    # Logika Login Admin
+    if data.username == "admin" and data.password == "admin123":
+        return {
+            "access_token": "secret-token-admin",
+            "role": "admin",
+            "name": "Administrator Lab"
+        }
+
+    # Logika Login Mahasiswa (Berdasarkan format NIM)
+    elif data.username.startswith("J") or data.username.startswith("j"):
+        # Anda bisa menambahkan verify_student(data.username, ...) di sini jika perlu
+        return {
+            "access_token": "token-mahasiswa",
+            "role": "mahasiswa",
+            "name": data.username
+        }
+
+    raise HTTPException(
+        status_code=401, detail="Username atau Password salah.")
 
 
 # ────────────────────────────────────────────────────────
-# Input Validation Helpers [S2]
+# Input Validation Helpers
 # ────────────────────────────────────────────────────────
 _NIM_RE = re.compile(NIM_PATTERN)
 
 
 def _validate_nim(nim: str) -> str:
-    """Validate dan sanitize NIM. Raises HTTPException jika invalid."""
     nim = nim.strip().upper()
     if not _NIM_RE.match(nim):
         raise HTTPException(
             status_code=400,
-            detail=f"Format NIM tidak valid: '{nim}'. Expected: J + 6-12 alphanumeric chars."
+            detail=f"Format NIM tidak valid: '{nim}'."
         )
     return nim
 
 
 def _ensure_pipeline_ready():
-    """Guard: pastikan pipeline siap. Raises HTTPException jika belum."""
     if not pipeline or not pipeline.is_ready():
-        raise HTTPException(
-            status_code=503,
-            detail="ML pipeline not ready. Model might be missing."
-        )
-
-
-def _get_face_verifier() -> FaceVerifier:
-    """Lazy-load FaceVerifier singleton. Model InsightFace di-load sekali."""
-    global face_verifier
-    if face_verifier is None:
-        logger.info("🛠 Inisialisasi FaceVerifier untuk API...")
-        face_verifier = FaceVerifier()
-    return face_verifier
+        raise HTTPException(status_code=503, detail="ML pipeline not ready.")
 
 
 # ────────────────────────────────────────────────────────
 # Helper
 # ────────────────────────────────────────────────────────
 def decode_base64_image(data: str) -> Optional[np.ndarray]:
-    """Decode base64-encoded image ke numpy array (BGR)."""
     try:
         if "," in data:
             data = data.split(",", 1)[1]
         img_bytes = base64.b64decode(data)
-        # [S3] Size check for base64 too
         if len(img_bytes) > MAX_UPLOAD_BYTES:
-            logger.warning(f"Base64 image too large: {len(img_bytes)} bytes")
             return None
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return img
     except Exception as e:
-        logger.error(f"Failed to decode image: {type(e).__name__}")  # [S4] No detail leak
+        logger.error(f"Failed to decode image: {type(e).__name__}")
         return None
 
 
 def _process_scan_result(result: ScanResult) -> dict:
-    """
-    Process scan result: verify DB identity.
-    [M4] Single source of truth untuk scan→verify logic.
-    [SECURITY] TIDAK auto check-in. Frontend harus panggil /api/face/* dulu.
-    """
     response = result.to_dict()
-
     if result.nim_final and result.nama:
-        # [M-01] has_active_peminjaman sudah diimport di top-level
         db_res = verify_student(result.nim_final, result.nama)
         response["db_verified"] = db_res["verified"]
         response["db_nama"] = db_res.get("nama_db")
@@ -313,19 +178,7 @@ def _process_scan_result(result: ScanResult) -> dict:
         response["db_message"] = db_res.get("message")
 
         if db_res["verified"]:
-            # Cek dulu apakah mahasiswa ini sudah/sedang di dalam lab (punya sesi aktif)
-            if has_active_peminjaman(result.nim_final):
-                response["action_required"] = "already_checked_in"
-                nama_panggilan = response.get('db_nama', result.nim_final)
-                response["db_message"] = (f"Mahasiswa atas nama {nama_panggilan} ({result.nim_final}) "
-                    "masih memiliki sesi di dalam lab. Silakan check-out terlebih dahulu.")
-            else:
-                # [Optimasi] Gunakan has_face_encoding (SELECT 1) bukan load_face_encoding
-                # agar tidak fetch LONGBLOB ~2KB hanya untuk cek existence
-                response["action_required"] = (
-                    "face_verify" if has_face_encoding(result.nim_final) else "face_enroll"
-                )
-
+            response["action_required"] = "face_verification"
     return response
 
 
@@ -334,530 +187,77 @@ def _process_scan_result(result: ScanResult) -> dict:
 # ────────────────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     return {
         "status": "ok",
         "model_loaded": pipeline.is_ready() if pipeline else False,
-        "service": "smart-lab-ml-engine",
     }
 
 
 @app.post("/api/scan")
 async def scan_image(file: UploadFile = File(...)):
-    """
-    REST endpoint untuk scan single image.
-    [S3] File size limit enforced.
-    """
     _ensure_pipeline_ready()
-
-    # [S3] Read with size limit
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File terlalu besar. Maksimal {MAX_UPLOAD_SIZE_MB}MB."
-        )
+        raise HTTPException(status_code=413, detail="File terlalu besar.")
 
     nparr = np.frombuffer(contents, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
     if frame is None:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    # Process + DB verify [M4] — via shared helper
     t_start = time.perf_counter()
     result = pipeline.process_frame(frame)
     response = _process_scan_result(result)
-    response["processing_time_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
-
+    response["processing_time_ms"] = round(
+        (time.perf_counter() - t_start) * 1000, 1)
     return response
 
 
-# ────────────────────────────────────────────────────────
-# WebSocket Endpoint [R3] — now with DB integration
-# ────────────────────────────────────────────────────────
 @app.websocket("/ws/scan")
 async def websocket_scan(ws: WebSocket):
-    """
-    WebSocket endpoint untuk real-time KTM scanning.
-    [R3] Sekarang include DB verify + check-in.
-    """
     await ws.accept()
     client_id = id(ws)
-    logger.info(f"🔌 WebSocket connected: {client_id}")
-
     last_process_time = 0.0
-
     try:
         while True:
             raw_data = await ws.receive_text()
-
-            # Debounce
             now = time.time() * 1000
             if now - last_process_time < WS_MIN_INTERVAL_MS:
-                await ws.send_json({"status": "skipped", "reason": "debounce"})
                 continue
 
-            # Decode image
             try:
                 msg = json.loads(raw_data)
                 image_data = msg.get("image", msg.get("frame", raw_data))
-            except (json.JSONDecodeError, TypeError):
+            except:
                 image_data = raw_data
 
             frame = decode_base64_image(image_data)
-
             if frame is None:
-                await ws.send_json({"status": "error", "error": "Failed to decode image."})
                 continue
 
-            # Process + DB verify [R3][M4]
             if pipeline and pipeline.is_ready():
                 result = await asyncio.to_thread(pipeline.process_frame, frame)
-                response = _process_scan_result(result)  # shared logic
+                response = _process_scan_result(result)
             else:
-                response = {"status": "model_not_loaded", "error": "ML model not available."}
+                response = {"status": "error", "message": "Model not loaded"}
 
             await ws.send_json(response)
             last_process_time = time.time() * 1000
-
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected: {client_id}")
-    except Exception as e:
-        # [O-02] Log hanya type name, bukan detail internal (tidak leak ke client)
-        logger.error(f"❌ WebSocket error [{client_id}]: {type(e).__name__}")
-        try:
-            await ws.close(code=1011, reason="Internal error")  # [S4] No detail leak
-        except Exception:
-            pass
+        logger.info(f"🔌 Disconnected: {client_id}")
 
 
-# ────────────────────────────────────────────────────────
-# Face Verification Endpoints
-# ────────────────────────────────────────────────────────
-@app.post(
-    "/api/face/enroll", 
-    response_model=FaceResponse,
-    responses={
-        400: {"description": "Format input/gambar Invalid"},
-        404: {"description": "NIM tidak ditemukan di DB"},
-        409: {"description": "Wajah sudah terdaftar"},
-        422: {"description": "Gagal deteksi wajah (misal tak ada wajah di kamera)"},
-    }
-)
-async def api_face_enroll(req: FaceRequest):
-    """
-    Pendaftaran wajah mahasiswa (pertama kali).
-    Menerima foto wajah Base64 + NIM + Nama → simpan 512-D embedding ke DB.
-    """
-    nim = _validate_nim(req.nim)
-
-    # Validasi: NIM harus ada di DB & (opsional) Nama sesuai dengan KTM
-    db_res = await asyncio.to_thread(verify_student, nim, req.nama)
-    if not db_res.get("verified"):
-        raise HTTPException(status_code=404, detail=db_res.get("message", "NIM tidak ditemukan / Nama tidak cocok"))
-
-    # Validasi: belum punya encoding (jika sudah ada, pakai /verify)
-    existing = await asyncio.to_thread(load_face_encoding, nim)
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Wajah untuk {nim} sudah terdaftar. Gunakan /api/face/verify."
-        )
-
-    # Decode gambar
-    frame = decode_base64_image(req.image_base64)
-    if frame is None:
-        raise HTTPException(status_code=400, detail="Gagal decode gambar. Pastikan format Base64 valid.")
-
-    # Enroll: extract 512-D embedding (Aman dari Race Condition)
-    t_start = time.perf_counter()
-    async with face_verifier_lock:
-        fv = _get_face_verifier()
-        enroll_res = await asyncio.to_thread(fv.enroll, frame)
-    elapsed = round((time.perf_counter() - t_start) * 1000, 1)
-
-    if not enroll_res["success"]:
-        if enroll_res.get("spoof_detected"):
-            raise HTTPException(
-                status_code=406,
-                detail=enroll_res.get("message", "Akses Ditolak: Indikasi Wajah Palsu/Spoofing.")
-            )
-            
-        return JSONResponse(status_code=422, content={
-            "status": "failed",
-            "message": enroll_res["message"],
-            "processing_time_ms": elapsed,
-        })
-
-    # Simpan encoding ke DB + check-in (Aman dari Race Condition)
-    await asyncio.to_thread(save_face_encoding, nim, enroll_res["encoding"])
-    ci = await asyncio.to_thread(check_in, nim)
-
-    return FaceResponse(
-        status="enrolled",
-        nim=nim,
-        nama=db_res.get("nama_db"),
-        checkin=ci,
-        processing_time_ms=elapsed,
-    )
-
-
-@app.post(
-    "/api/face/verify", 
-    response_model=FaceResponse,
-    responses={
-        400: {"description": "Format input/gambar Invalid"},
-        403: {"description": "Wajah TIDAK cocok dengan DB"},
-        404: {"description": "Wajah/NIM belum terdaftar"},
-        406: {"description": "Terdeteksi Indikasi Spoofing (Wajah Palsu / Layar HP)"},
-    }
-)
-async def api_face_verify(req: FaceRequest):
-    """
-    Verifikasi wajah mahasiswa (absensi harian).
-    Menerima foto wajah Base64 + NIM → compare dengan DB → check-in jika cocok.
-    """
-    nim = _validate_nim(req.nim)
-
-    # Validasi: NIM harus ada di DB
-    db_res = await asyncio.to_thread(verify_student, nim, req.nama)
-    if not db_res.get("verified"):
-        raise HTTPException(status_code=404, detail=db_res.get("message", "NIM tidak ditemukan / Nama tidak cocok"))
-
-    # Validasi: harus sudah punya encoding
-    db_encoding = await asyncio.to_thread(load_face_encoding, nim)
-    if db_encoding is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Wajah untuk {nim} belum terdaftar. Gunakan /api/face/enroll dulu."
-        )
-
-    # Decode gambar
-    frame = decode_base64_image(req.image_base64)
-    if frame is None:
-        raise HTTPException(status_code=400, detail="Gagal decode gambar. Pastikan format Base64 valid.")
-
-    # Verify: compare live face vs DB encoding (Aman dari Race Condition)
-    t_start = time.perf_counter()
-    async with face_verifier_lock:
-        fv = _get_face_verifier()
-        fv.set_reference_from_encoding(db_encoding)
-        verify_res = await asyncio.to_thread(fv.verify, frame)
-        fv.clear_reference()  # Bersihkan state setelah selesai
-    elapsed = round((time.perf_counter() - t_start) * 1000, 1)
-
-    if verify_res.get("spoof_detected"):
-        raise HTTPException(
-            status_code=406,
-            detail=verify_res.get("message", "Akses Ditolak: Indikasi Wajah Palsu/Spoofing.")
-        )
-
-    if verify_res["verified"]:
-        ci = await asyncio.to_thread(check_in, nim)
-        
-        # Block: Jika mahasiswa sudah punya sesi aktif, tolak verifikasi lagi
-        if not ci.get("success"):
-            raise HTTPException(
-                status_code=409,
-                detail=ci.get("message", "Mahasiswa sedang berada di dalam lab.")
-            )
-
-        return FaceResponse(
-            status="verified",
-            nim=nim,
-            nama=db_res.get("nama_db"),
-            similarity=verify_res["similarity"],
-            checkin=ci,
-            processing_time_ms=elapsed,
-        )
-
-    return JSONResponse(status_code=403, content={
-        "status": "rejected",
-        "nim": nim,
-        "similarity": verify_res["similarity"],
-        "message": verify_res["message"],
-        "processing_time_ms": elapsed,
-    })
-
-@app.delete(
-    "/api/face/{nim}",
-    dependencies=[Depends(get_current_admin)],
-    responses={
-        401: {"description": "Unauthorized — Token JWT tidak valid/kedaluwarsa"},
-        404: {"description": "NIM tidak ditemukan"},
-    }
-)
-async def api_face_reset(nim: str):
-    """
-    [ADMIN] Reset / hapus face encoding mahasiswa dari database.
-    Berguna jika mahasiswa salah melakukan enrollment wajah.
-    Membutuhkan: Bearer Token JWT dari /api/auth/login
-    """
-    nim = _validate_nim(nim)
-    res = await asyncio.to_thread(delete_face_encoding, nim)
-    if not res["success"]:
-        raise HTTPException(status_code=404, detail=res["message"])
-    return {"status": "success", "message": res["message"]}
-
-# ────────────────────────────────────────────────────────
-# Checkout, Status, & ACC Endpoints
-# ────────────────────────────────────────────────────────
-# ─── Login & Status Endpoints ────────────────────────────
-
-@app.post("/api/auth/login")
-async def api_login(
-    request: Request,
-    form: OAuth2PasswordRequestForm = Depends(),
-):
-    """
-    Login admin. Return JWT access token.
-    Format input: form-data (username + password)
-    [S-02] Rate limited: maksimal LOGIN_MAX_ATTEMPTS percobaan per LOGIN_WINDOW_SECONDS detik per IP.
-    """
-    # [S-02] Rate limiter berbasis IP — in-memory sliding window
-    # [BUG-01 FIX] Ambil IP dari Request object yang di-inject FastAPI
-    client_ip = request.client.host if request.client else "unknown"
-    now_ts = time.time()
-    attempt_log = _LOGIN_ATTEMPTS[client_ip]
-    # Hapus percobaan yang sudah di luar window
-    _LOGIN_ATTEMPTS[client_ip] = [t for t in attempt_log if now_ts - t < _LOGIN_WINDOW_SECONDS]
-    if len(_LOGIN_ATTEMPTS[client_ip]) >= _LOGIN_MAX_ATTEMPTS:
-        logger.warning(f"[S-02] Rate limit tercapai untuk IP: {client_ip}")
-        raise HTTPException(
-            status_code=429,
-            detail=f"Terlalu banyak percobaan login. Coba lagi dalam {_LOGIN_WINDOW_SECONDS} detik.",
-            headers={"Retry-After": str(_LOGIN_WINDOW_SECONDS)},
-        )
-    _LOGIN_ATTEMPTS[client_ip].append(now_ts)
-
-    admin = get_admin_by_username(form.username)
-    if not admin or not verify_password(form.password, admin["password_hash"]):
-        raise HTTPException(
-            status_code=401,
-            detail="Username atau password salah.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not admin.get("is_active"):
-        raise HTTPException(status_code=403, detail="Akun admin tidak aktif.")
-
-    # Login berhasil — hapus tracking untuk IP ini
-    _LOGIN_ATTEMPTS.pop(client_ip, None)
-    token = create_access_token(data={"sub": admin["username"]})
-    return {"access_token": token, "token_type": "bearer"}
-
-
-@app.post("/api/checkout/{nim}", dependencies=[Depends(get_current_admin)])
+@app.post("/api/checkout/{nim}")
 async def api_checkout(nim: str):
-    """[ADMIN] Check-out mahasiswa dari lab. Membutuhkan Bearer Token."""
     nim = _validate_nim(nim)
-    return await asyncio.to_thread(check_out, nim)
-
-@app.post("/api/peminjaman/{pid}/approve", dependencies=[Depends(get_current_admin)])
-async def api_approve(pid: int):
-    """[ADMIN] Setujui mahasiswa masuk ke dalam lab (ubah status menunggu -> aktif)"""
-    # [M-01] approve_peminjaman sudah diimport di top-level
-    res = await asyncio.to_thread(approve_peminjaman, pid)
-    if not res["success"]:
-        raise HTTPException(status_code=400, detail=res["message"])
-    return res
+    return check_out(nim)
 
 
-@app.post("/api/peminjaman/{pid}/reject", dependencies=[Depends(get_current_admin)])
-async def api_reject(pid: int):
-    """[ADMIN] Tolak mahasiswa masuk ke dalam lab (ubah status menunggu -> ditolak)"""
-    # [M-01] reject_peminjaman sudah diimport di top-level
-    res = await asyncio.to_thread(reject_peminjaman, pid)
-    if not res["success"]:
-        raise HTTPException(status_code=400, detail=res["message"])
-    return res
-
-
-@app.get(
-    "/api/status",
-    dependencies=[Depends(get_current_admin)]
-)
+@app.get("/api/status")
 async def api_status():
-    """[ADMIN] List peminjaman aktif & menunggu ACC. Membutuhkan Bearer Token JWT."""
-    peminjaman_list = await asyncio.to_thread(get_active_peminjaman)
-    
-    # Split them for frontend convenience
-    active = [p for p in peminjaman_list if p["status"] == "aktif"]
-    pending = [p for p in peminjaman_list if p["status"] == "menunggu"]
-    
-    return {
-        "active_count": len(active),
-        "pending_count": len(pending),
-        "peminjaman": active,
-        "peminjaman_pending": pending
-    }
+    active = get_active_peminjaman()
+    return {"active_count": len(active), "peminjaman": active}
 
-
-@app.get("/api/public/status")
-async def api_public_status():
-    """Public endpoint: status peminjaman aktif/meminta ACC."""
-    peminjaman_list = await asyncio.to_thread(get_active_peminjaman)
-    active = [p for p in peminjaman_list if p["status"] == "aktif"]
-    pending = [p for p in peminjaman_list if p["status"] == "menunggu"]
-    return {
-        "active_count": len(active),
-        "pending_count": len(pending),
-        "peminjaman": active,
-        "peminjaman_pending": pending
-    }
-
-
-@app.get("/api/public/jadwal")
-async def api_public_jadwal(archived: bool = False):
-    """Public endpoint: list jadwal laboratorium."""
-    return await asyncio.to_thread(get_jadwal, archived)
-
-
-# ────────────────────────────────────────────────────────
-# Lab Management Endpoints
-# ────────────────────────────────────────────────────────
-@app.get("/api/labs", dependencies=[Depends(get_current_admin)])
-async def api_get_labs():
-    """[ADMIN] List semua laboratorium."""
-    return await asyncio.to_thread(get_labs)
-
-
-@app.post("/api/labs", dependencies=[Depends(get_current_admin)])
-async def api_create_lab(payload: LabPayload):
-    """[ADMIN] Buat laboratorium baru."""
-    return await asyncio.to_thread(
-        create_lab,
-        payload.name,
-        payload.location,
-        payload.capacity,
-        payload.op_start,
-        payload.op_end,
-        payload.use_start,
-        payload.use_end,
-        payload.equipment or [],
-        payload.status_override,
-    )
-
-
-@app.put("/api/labs/{lab_id}", dependencies=[Depends(get_current_admin)])
-async def api_update_lab(lab_id: int, payload: LabPayload):
-    """[ADMIN] Update data laboratorium."""
-    updated = await asyncio.to_thread(
-        update_lab,
-        lab_id,
-        payload.name,
-        payload.location,
-        payload.capacity,
-        payload.op_start,
-        payload.op_end,
-        payload.use_start,
-        payload.use_end,
-        payload.equipment or [],
-        payload.status_override,
-    )
-    if not updated:
-        raise HTTPException(status_code=404, detail="Lab tidak ditemukan")
-    return updated
-
-
-@app.delete("/api/labs/{lab_id}", dependencies=[Depends(get_current_admin)])
-async def api_delete_lab(lab_id: int):
-    """[ADMIN] Hapus lab."""
-    success = await asyncio.to_thread(delete_lab, lab_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Lab tidak ditemukan")
-    return {"success": True}
-
-
-# ────────────────────────────────────────────────────────
-# Schedule (Jadwal) Endpoints
-# ────────────────────────────────────────────────────────
-@app.get("/api/jadwal", dependencies=[Depends(get_current_admin)])
-async def api_get_jadwal(archived: bool = False):
-    """[ADMIN] List jadwal laboratorium."""
-    return await asyncio.to_thread(get_jadwal, archived)
-
-
-@app.post("/api/jadwal", dependencies=[Depends(get_current_admin)])
-async def api_create_jadwal(payload: SchedulePayload):
-    """[ADMIN] Buat jadwal baru."""
-    return await asyncio.to_thread(
-        create_jadwal,
-        payload.mata_kuliah,
-        payload.kelas,
-        payload.prodi,
-        payload.lab,
-        payload.gedung,
-        payload.hari,
-        payload.jam_mulai,
-        payload.jam_selesai,
-        payload.tipe_semester,
-        payload.tahun_ajaran,
-        payload.status,
-    )
-
-
-@app.put("/api/jadwal/{jadwal_id}", dependencies=[Depends(get_current_admin)])
-async def api_update_jadwal(jadwal_id: int, payload: SchedulePayload):
-    """[ADMIN] Update jadwal."""
-    updated = await asyncio.to_thread(
-        update_jadwal,
-        jadwal_id,
-        payload.mata_kuliah,
-        payload.kelas,
-        payload.prodi,
-        payload.lab,
-        payload.gedung,
-        payload.hari,
-        payload.jam_mulai,
-        payload.jam_selesai,
-        payload.tipe_semester,
-        payload.tahun_ajaran,
-        payload.status,
-    )
-    if not updated:
-        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-    return updated
-
-
-@app.delete("/api/jadwal/{jadwal_id}", dependencies=[Depends(get_current_admin)])
-async def api_delete_jadwal(jadwal_id: int):
-    """[ADMIN] Hapus jadwal."""
-    success = await asyncio.to_thread(delete_jadwal, jadwal_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-    return {"success": True}
-
-
-@app.post("/api/jadwal/archive", dependencies=[Depends(get_current_admin)])
-async def api_archive_jadwal():
-    """[ADMIN] Archive semua jadwal (reset semester)."""
-    count = await asyncio.to_thread(archive_all_jadwal)
-    return {"success": True, "archived_count": count}
-
-
-# ────────────────────────────────────────────────────────
-# Reporting Endpoints
-# ────────────────────────────────────────────────────────
-@app.get("/api/reports/peminjaman", dependencies=[Depends(get_current_admin)])
-async def api_get_peminjaman_history(
-    year: Optional[int] = None,
-    month: Optional[int] = None,
-    prodi: Optional[str] = None,
-):
-    """[ADMIN] Ambil riwayat peminjaman (peminjaman selesai/ditolak)."""
-    return await asyncio.to_thread(get_peminjaman_history, year, month, prodi)
-
-
-# ────────────────────────────────────────────────────────
-# Run (development only)
-# ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
