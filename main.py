@@ -51,7 +51,7 @@ from db.database import (
     init_db, verify_student, check_in, check_out,
     get_active_peminjaman, reset_all_peminjaman, NIM_PATTERN,
     save_face_encoding, load_face_encoding, delete_face_encoding,
-    get_admin_by_username, has_active_peminjaman, has_face_encoding,
+    get_admin_by_username, get_user_by_username, has_active_peminjaman, has_face_encoding,
     # Lab management
     get_labs, get_lab, create_lab, update_lab, delete_lab,
     # Schedule (Jadwal)
@@ -94,13 +94,14 @@ async def get_current_admin(token: str = Depends(oauth2_scheme)):
     try:
         payload = decode_token(token)
         username: str = payload.get("sub")
-        if not username:
+        role: str = payload.get("role")
+        if not username or role != "admin":
             raise HTTPException(status_code=401, detail="Token tidak valid.")
     except JWTError:
         raise HTTPException(status_code=401, detail="Token tidak valid atau kedaluwarsa.")
 
-    admin = get_admin_by_username(username)
-    if not admin or not admin.get("is_active"):
+    admin = get_user_by_username(username)
+    if not admin or admin.get("role") != "admin" or not admin.get("is_active"):
         raise HTTPException(status_code=401, detail="Akun admin tidak aktif atau tidak ditemukan.")
     return admin
 
@@ -611,7 +612,7 @@ async def api_login(
     form: OAuth2PasswordRequestForm = Depends(),
 ):
     """
-    Login admin. Return JWT access token.
+    Login admin atau mahasiswa. Return JWT access token dan role.
     Format input: form-data (username + password)
     [S-02] Rate limited: maksimal LOGIN_MAX_ATTEMPTS percobaan per LOGIN_WINDOW_SECONDS detik per IP.
     """
@@ -631,20 +632,32 @@ async def api_login(
         )
     _LOGIN_ATTEMPTS[client_ip].append(now_ts)
 
-    admin = get_admin_by_username(form.username)
-    if not admin or not verify_password(form.password, admin["password_hash"]):
+    user = get_user_by_username(form.username)
+    if user and user.get("role") == "mahasiswa":
+        password_to_verify = form.password.lower()
+    else:
+        password_to_verify = form.password
+
+    if not user or not user.get("password_hash") or not verify_password(password_to_verify, user["password_hash"]):
         raise HTTPException(
             status_code=401,
             detail="Username atau password salah.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not admin.get("is_active"):
-        raise HTTPException(status_code=403, detail="Akun admin tidak aktif.")
+    if not user.get("is_active"):
+        raise HTTPException(status_code=403, detail="Akun tidak aktif.")
 
     # Login berhasil — hapus tracking untuk IP ini
     _LOGIN_ATTEMPTS.pop(client_ip, None)
-    token = create_access_token(data={"sub": admin["username"]})
-    return {"access_token": token, "token_type": "bearer"}
+    token = create_access_token(data={"sub": user["username"], "role": user["role"]})
+    redirect_url = "/adminlab/dashboard" if user["role"] == "admin" else "/"
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": user["role"],
+        "name": user.get("nama") or user.get("username"),
+        "redirect_url": redirect_url,
+    }
 
 
 @app.post("/api/checkout/{nim}", dependencies=[Depends(get_current_admin)])

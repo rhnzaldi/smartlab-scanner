@@ -113,6 +113,19 @@ def _timed_db_op(func):
     return wrapper
 
 
+@_timed_db_op
+def column_exists(table: str, column: str) -> bool:
+    """Check if a given column exists in a table."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                (DB_NAME, table, column),
+            )
+            return cursor.fetchone()["cnt"] > 0
+
+
 # ────────────────────────────────────────────────────────
 # Schema & Seed
 # ────────────────────────────────────────────────────────
@@ -129,9 +142,12 @@ def init_db():
                     angkatan INT,
                     status VARCHAR(20) DEFAULT 'aktif',
                     face_encoding LONGBLOB,
+                    password_hash VARCHAR(255) NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            if not column_exists("mahasiswa", "password_hash"):
+                cursor.execute("ALTER TABLE mahasiswa ADD COLUMN password_hash VARCHAR(255) NULL")
 
             # Tabel peminjaman
             cursor.execute("""
@@ -164,10 +180,13 @@ def init_db():
                     username VARCHAR(50) UNIQUE NOT NULL,
                     email VARCHAR(100) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
+                    role VARCHAR(20) NOT NULL DEFAULT 'admin',
                     is_active BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            if not column_exists("admin_users", "role"):
+                cursor.execute("ALTER TABLE admin_users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'admin'")
 
             # Seed default admin
             cursor.execute("SELECT COUNT(*) AS cnt FROM admin_users")
@@ -175,15 +194,27 @@ def init_db():
                 # Import di sini untuk hindari circular import
                 from security import get_password_hash
                 cursor.execute("""
-                    INSERT INTO admin_users (username, email, password_hash)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO admin_users (username, email, password_hash, role)
+                    VALUES (%s, %s, %s, %s)
                 """, (
                     "admin",
                     "admin@smartlab.id",
                     get_password_hash("admin123"),
+                    "admin",
                 ))
                 # [SEED-01 FIX] Tidak log password ke output
                 logger.info("✅ Seed admin dibuat. Ganti password segera via /api/auth/login.")
+
+            # Seed default mahasiswa passwords jika belum ada
+            cursor.execute("SELECT nim FROM mahasiswa WHERE password_hash IS NULL")
+            missing_passwords = cursor.fetchall()
+            if missing_passwords:
+                from security import get_password_hash
+                for row in missing_passwords:
+                    cursor.execute(
+                        "UPDATE mahasiswa SET password_hash = %s WHERE nim = %s",
+                        (get_password_hash(row["nim"]), row["nim"])
+                    )
 
             # Tabel labs (untuk manajemen laboratorium)
             cursor.execute("""
@@ -245,15 +276,41 @@ def init_db():
 # Admin User Functions
 # ────────────────────────────────────────────────
 @_timed_db_op
-def get_admin_by_username(username: str) -> Optional[Dict]:
-    """Cari admin berdasarkan username. Returns dict atau None."""
+def get_user_by_username(username: str) -> Optional[Dict]:
+    """Cari user baik admin maupun mahasiswa berdasarkan username/NIM."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT id, username, email, password_hash, is_active FROM admin_users WHERE username = %s",
+                "SELECT id, username, email, password_hash, is_active, role FROM admin_users WHERE username = %s",
                 (username,)
             )
-            return cursor.fetchone()
+            user = cursor.fetchone()
+            if user:
+                return user
+
+    # Fallback: mahasiswa login menggunakan NIM (case-insensitive untuk 'J'/'j')
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT nim, nama, prodi, angkatan, status, password_hash FROM mahasiswa WHERE UPPER(nim) = UPPER(%s)",
+                (username,)
+            )
+            mahasiswa = cursor.fetchone()
+            if not mahasiswa:
+                return None
+            mahasiswa["username"] = mahasiswa["nim"]
+            mahasiswa["role"] = "mahasiswa"
+            mahasiswa["is_active"] = mahasiswa.get("status") == "aktif"
+            return mahasiswa
+
+
+@_timed_db_op
+def get_admin_by_username(username: str) -> Optional[Dict]:
+    """Cari admin berdasarkan username. Returns dict atau None."""
+    user = get_user_by_username(username)
+    if user and user.get("role") == "admin":
+        return user
+    return None
 
 
 # ────────────────────────────────────────────────────────
@@ -555,6 +612,29 @@ def lookup_mahasiswa(nim: str) -> Optional[Dict]:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM mahasiswa WHERE nim = %s", (nim,))
             return cursor.fetchone()
+
+
+@_timed_db_op
+def update_mahasiswa_attrs(nim: str, **attrs) -> bool:
+    """Update atribut mahasiswa menggunakan nama kolom yang diizinkan."""
+    allowed_keys = {"nama", "prodi", "angkatan", "status", "password_hash", "face_encoding"}
+    cols = []
+    values = []
+    for key, value in attrs.items():
+        if key in allowed_keys:
+            cols.append(f"{key} = %s")
+            values.append(value)
+    if not cols:
+        return False
+
+    values.append(nim)
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE mahasiswa SET {', '.join(cols)} WHERE nim = %s",
+                tuple(values),
+            )
+            return cursor.rowcount > 0
 
 
 def fuzzy_name_match(ocr_name: str, db_name: str) -> float:

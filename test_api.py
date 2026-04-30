@@ -89,6 +89,24 @@ def test_api_status_empty():
     assert data["active_count"] == 0
 
 
+def test_api_login_admin_redirect():
+    """Test login admin returns role and dashboard redirect."""
+    res = client.post("/api/auth/login", data={"username": "admin", "password": "admin123"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["role"] == "admin"
+    assert body["redirect_url"] == "/dashboard"
+
+
+def test_api_login_mahasiswa_redirect():
+    """Test login mahasiswa returns role and compro redirect."""
+    res = client.post("/api/auth/login", data={"username": TEST_NIM, "password": TEST_NIM})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["role"] == "mahasiswa"
+    assert body["redirect_url"] == "/compro"
+
+
 def test_api_status_unauthorized():
     """Test status ditolak tanpa admin key."""
     res = client.get("/api/status")
