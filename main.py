@@ -106,6 +106,34 @@ async def get_current_admin(token: str = Depends(oauth2_scheme)):
     return admin
 
 
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """
+    JWT Dependency Guard untuk semua login user.
+    Verifikasi Bearer token dan pastikan akun aktif.
+    """
+    try:
+        payload = decode_token(token)
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Token tidak valid.")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token tidak valid atau kedaluwarsa.")
+
+    user = get_user_by_username(username)
+    if not user or not user.get("is_active"):
+        raise HTTPException(status_code=401, detail="Akun tidak aktif atau tidak ditemukan.")
+    return user
+
+
+async def get_current_student(current_user: dict = Depends(get_current_user)):
+    """
+    JWT Dependency Guard khusus mahasiswa.
+    """
+    if current_user.get("role") != "mahasiswa":
+        raise HTTPException(status_code=403, detail="Akses mahasiswa diperlukan.")
+    return current_user
+
+
 # ────────────────────────────────────────────────────────
 # Logging
 # ────────────────────────────────────────────────────────
@@ -446,12 +474,16 @@ async def websocket_scan(ws: WebSocket):
         422: {"description": "Gagal deteksi wajah (misal tak ada wajah di kamera)"},
     }
 )
-async def api_face_enroll(req: FaceRequest):
+async def api_face_enroll(req: FaceRequest, current_user: dict = Depends(get_current_student)):
     """
     Pendaftaran wajah mahasiswa (pertama kali).
     Menerima foto wajah Base64 + NIM + Nama → simpan 512-D embedding ke DB.
     """
-    nim = _validate_nim(req.nim)
+    logged_nim = current_user["username"]
+    req_nim = _validate_nim(req.nim)
+    if req_nim != logged_nim:
+        raise HTTPException(status_code=403, detail="NIM harus sesuai dengan akun mahasiswa yang login.")
+    nim = req_nim
 
     # Validasi: NIM harus ada di DB & (opsional) Nama sesuai dengan KTM
     db_res = await asyncio.to_thread(verify_student, nim, req.nama)
@@ -514,12 +546,16 @@ async def api_face_enroll(req: FaceRequest):
         406: {"description": "Terdeteksi Indikasi Spoofing (Wajah Palsu / Layar HP)"},
     }
 )
-async def api_face_verify(req: FaceRequest):
+async def api_face_verify(req: FaceRequest, current_user: dict = Depends(get_current_student)):
     """
     Verifikasi wajah mahasiswa (absensi harian).
     Menerima foto wajah Base64 + NIM → compare dengan DB → check-in jika cocok.
     """
-    nim = _validate_nim(req.nim)
+    logged_nim = current_user["username"]
+    req_nim = _validate_nim(req.nim)
+    if req_nim != logged_nim:
+        raise HTTPException(status_code=403, detail="NIM harus sesuai dengan akun mahasiswa yang login.")
+    nim = req_nim
 
     # Validasi: NIM harus ada di DB
     db_res = await asyncio.to_thread(verify_student, nim, req.nama)
@@ -717,6 +753,21 @@ async def api_public_status():
         "pending_count": len(pending),
         "peminjaman": active,
         "peminjaman_pending": pending
+    }
+
+
+@app.get("/api/me/peminjaman")
+async def api_my_peminjaman(current_user: dict = Depends(get_current_student)):
+    """Mahasiswa login: lihat peminjaman aktif atau menunggu untuk akun sendiri."""
+    peminjaman_list = await asyncio.to_thread(get_active_peminjaman)
+    my_nim = current_user["username"]
+    my_peminjaman = [p for p in peminjaman_list if p["nim"].upper() == my_nim.upper()]
+    return {
+        "nim": my_nim,
+        "name": current_user.get("nama"),
+        "peminjaman": my_peminjaman,
+        "active_count": len([p for p in my_peminjaman if p["status"] == "aktif"]),
+        "pending_count": len([p for p in my_peminjaman if p["status"] == "menunggu"]),
     }
 
 
