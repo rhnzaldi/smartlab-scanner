@@ -22,6 +22,11 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 from difflib import SequenceMatcher
 
+# [P-02] Simple TTL cache untuk get_active_peminjaman
+# Menghindari query DB berulang saat 3 endpoint polling bersamaan
+_PEMINJAMAN_CACHE: dict = {"data": None, "ts": 0.0}
+_PEMINJAMAN_CACHE_TTL = 3.0  # detik
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -113,6 +118,19 @@ def _timed_db_op(func):
     return wrapper
 
 
+@_timed_db_op
+def column_exists(table: str, column: str) -> bool:
+    """Check if a given column exists in a table."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                (DB_NAME, table, column),
+            )
+            return cursor.fetchone()["cnt"] > 0
+
+
 # ────────────────────────────────────────────────────────
 # Schema & Seed
 # ────────────────────────────────────────────────────────
@@ -129,9 +147,12 @@ def init_db():
                     angkatan INT,
                     status VARCHAR(20) DEFAULT 'aktif',
                     face_encoding LONGBLOB,
+                    password_hash VARCHAR(255) NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            if not column_exists("mahasiswa", "password_hash"):
+                cursor.execute("ALTER TABLE mahasiswa ADD COLUMN password_hash VARCHAR(255) NULL")
 
             # Tabel peminjaman
             cursor.execute("""
@@ -164,10 +185,13 @@ def init_db():
                     username VARCHAR(50) UNIQUE NOT NULL,
                     email VARCHAR(100) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
+                    role VARCHAR(20) NOT NULL DEFAULT 'admin',
                     is_active BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            if not column_exists("admin_users", "role"):
+                cursor.execute("ALTER TABLE admin_users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'admin'")
 
             # Seed default admin
             cursor.execute("SELECT COUNT(*) AS cnt FROM admin_users")
@@ -175,15 +199,27 @@ def init_db():
                 # Import di sini untuk hindari circular import
                 from security import get_password_hash
                 cursor.execute("""
-                    INSERT INTO admin_users (username, email, password_hash)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO admin_users (username, email, password_hash, role)
+                    VALUES (%s, %s, %s, %s)
                 """, (
                     "admin",
                     "admin@smartlab.id",
                     get_password_hash("admin123"),
+                    "admin",
                 ))
                 # [SEED-01 FIX] Tidak log password ke output
                 logger.info("✅ Seed admin dibuat. Ganti password segera via /api/auth/login.")
+
+            # Seed default mahasiswa passwords jika belum ada
+            cursor.execute("SELECT nim FROM mahasiswa WHERE password_hash IS NULL")
+            missing_passwords = cursor.fetchall()
+            if missing_passwords:
+                from security import get_password_hash
+                for row in missing_passwords:
+                    cursor.execute(
+                        "UPDATE mahasiswa SET password_hash = %s WHERE nim = %s",
+                        (get_password_hash(row["nim"]), row["nim"])
+                    )
 
             # Tabel labs (untuk manajemen laboratorium)
             cursor.execute("""
@@ -245,15 +281,41 @@ def init_db():
 # Admin User Functions
 # ────────────────────────────────────────────────
 @_timed_db_op
-def get_admin_by_username(username: str) -> Optional[Dict]:
-    """Cari admin berdasarkan username. Returns dict atau None."""
+def get_user_by_username(username: str) -> Optional[Dict]:
+    """Cari user baik admin maupun mahasiswa berdasarkan username/NIM."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT id, username, email, password_hash, is_active FROM admin_users WHERE username = %s",
+                "SELECT id, username, email, password_hash, is_active, role FROM admin_users WHERE username = %s",
                 (username,)
             )
-            return cursor.fetchone()
+            user = cursor.fetchone()
+            if user:
+                return user
+
+    # Fallback: mahasiswa login menggunakan NIM (case-insensitive untuk 'J'/'j')
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT nim, nama, prodi, angkatan, status, password_hash FROM mahasiswa WHERE UPPER(nim) = UPPER(%s)",
+                (username,)
+            )
+            mahasiswa = cursor.fetchone()
+            if not mahasiswa:
+                return None
+            mahasiswa["username"] = mahasiswa["nim"]
+            mahasiswa["role"] = "mahasiswa"
+            mahasiswa["is_active"] = mahasiswa.get("status") == "aktif"
+            return mahasiswa
+
+
+@_timed_db_op
+def get_admin_by_username(username: str) -> Optional[Dict]:
+    """Cari admin berdasarkan username. Returns dict atau None."""
+    user = get_user_by_username(username)
+    if user and user.get("role") == "admin":
+        return user
+    return None
 
 
 # ────────────────────────────────────────────────────────
@@ -557,6 +619,29 @@ def lookup_mahasiswa(nim: str) -> Optional[Dict]:
             return cursor.fetchone()
 
 
+@_timed_db_op
+def update_mahasiswa_attrs(nim: str, **attrs) -> bool:
+    """Update atribut mahasiswa menggunakan nama kolom yang diizinkan."""
+    allowed_keys = {"nama", "prodi", "angkatan", "status", "password_hash", "face_encoding"}
+    cols = []
+    values = []
+    for key, value in attrs.items():
+        if key in allowed_keys:
+            cols.append(f"{key} = %s")
+            values.append(value)
+    if not cols:
+        return False
+
+    values.append(nim)
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE mahasiswa SET {', '.join(cols)} WHERE nim = %s",
+                tuple(values),
+            )
+            return cursor.rowcount > 0
+
+
 def fuzzy_name_match(ocr_name: str, db_name: str) -> float:
     """
     Hitung kesamaan nama dari OCR vs database.
@@ -702,11 +787,13 @@ def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
             pid = cursor.lastrowid
 
     logger.info(f"⏳ Check-in pending ACC: {nim} → {lab} (ID: {pid})")
+    _invalidate_peminjaman_cache()  # [P-02]
     return {
         "success": True,
         "message": f"⏳ Verifikasi Wajah Berhasil! Menunggu persetujuan Admin lab.",
         "peminjaman_id": pid,
         "waktu_masuk": now,
+        "lab": lab,
     }
 
 @_timed_db_op
@@ -732,6 +819,7 @@ def approve_peminjaman(pid: int) -> Dict:
                 )
     
     logger.info(f"✅ Approve peminjaman ID: {pid}")
+    _invalidate_peminjaman_cache()  # [P-02]
     return {"success": True, "message": "Peminjaman disetujui (Aktif)."}
 
 @_timed_db_op
@@ -750,6 +838,7 @@ def reject_peminjaman(pid: int) -> Dict:
             # Note: No need to update jadwal status to digunakan on reject, it stays tersedia/menunggu.
     
     logger.warning(f"❌ Reject peminjaman ID: {pid}")
+    _invalidate_peminjaman_cache()  # [P-02]
     return {"success": True, "message": "Peminjaman ditolak."}
 
 
@@ -801,6 +890,7 @@ def check_out(nim: str) -> Dict:
 
     durasi = _format_duration(waktu_masuk_str, now)
     logger.info(f"📤 Check-out: {nim} (durasi: {durasi})")
+    _invalidate_peminjaman_cache()  # [P-02]
     return {
         "success": True,
         "message": f"📤 Check-out! Durasi: {durasi}",
@@ -809,9 +899,21 @@ def check_out(nim: str) -> Dict:
     }
 
 
-@_timed_db_op
+def _invalidate_peminjaman_cache():
+    """[P-02] Hapus cache peminjaman agar fetch berikutnya selalu dari DB."""
+    _PEMINJAMAN_CACHE["data"] = None
+    _PEMINJAMAN_CACHE["ts"] = 0.0
+
+
 def get_active_peminjaman() -> List[Dict]:
-    """List semua peminjaman yang aktif atau sedang menunggu ACC."""
+    """
+    [P-02] List semua peminjaman aktif/menunggu, dengan TTL cache 3 detik.
+    Cache di-invalidate otomatis setelah check_in/check_out/approve/reject.
+    """
+    now = time.time()
+    if _PEMINJAMAN_CACHE["data"] is not None and (now - _PEMINJAMAN_CACHE["ts"]) < _PEMINJAMAN_CACHE_TTL:
+        return _PEMINJAMAN_CACHE["data"]
+
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -821,7 +923,11 @@ def get_active_peminjaman() -> List[Dict]:
                 WHERE p.status IN ('aktif', 'menunggu')
                 ORDER BY p.waktu_masuk DESC
             """)
-            return cursor.fetchall()
+            result = cursor.fetchall()
+
+    _PEMINJAMAN_CACHE["data"] = result
+    _PEMINJAMAN_CACHE["ts"] = time.time()
+    return result
 
 
 @_timed_db_op

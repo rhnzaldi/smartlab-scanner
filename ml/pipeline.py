@@ -338,40 +338,68 @@ class KTMPipeline:
                 nama_raw = extract_text_ocr(nama_crop)
             result.nama = clean_name(nama_raw)
 
-        # ── Step 5: Double Validation ──
+        # ── Step 5: Double Validation (4 Indikator) ──
+        # Keempat indikator yang WAJIB ada untuk validasi penuh:
+        #   1. qr_code   → nim_qr
+        #   2. text_nim   → nim_ocr
+        #   3. text_nama  → nama
+        #   4. face_photo → terdeteksi YOLO (bukti objek = KTM asli)
         nim_match, detail = validate_nim_match(result.nim_qr, result.nim_ocr)
         result.nim_match = nim_match
         result.validation_detail = detail
 
-        # Determine final NIM
+        # Determine final NIM (tetap simpan untuk logging/debug)
         if nim_match:
             result.nim_final = result.nim_qr
         elif result.nim_qr:
-            result.nim_final = result.nim_qr  # trust QR lebih dari OCR
+            result.nim_final = result.nim_qr
         elif result.nim_ocr:
             result.nim_final = result.nim_ocr
 
         # ── Determine overall success ──
-        # Sukses jika minimal ada NIM (dari sumber manapun) dan nama
-        has_nim = result.nim_final is not None
+        # Cek kehadiran keempat indikator
+        has_qr = result.nim_qr is not None
+        has_nim_ocr = result.nim_ocr is not None
         has_nama = result.nama is not None
-        result.success = has_nim and has_nama
+        has_face_photo = "face_photo" in result.detections_found
 
-        if result.success and result.nim_match:
+        # SUKSES hanya jika:
+        #   - QR code berhasil di-decode (has_qr)
+        #   - NIM OCR berhasil di-baca (has_nim_ocr)
+        #   - Nama berhasil di-baca (has_nama)
+        #   - Face photo terdeteksi YOLO (has_face_photo)
+        #   - NIM dari QR == NIM dari OCR (nim_match)
+        all_four_present = has_qr and has_nim_ocr and has_nama and has_face_photo
+        result.success = all_four_present and nim_match
+
+        if result.success:
             result.status = "validated"
-        elif result.success:
-            result.status = "partial_validation"
-        elif has_nim or has_nama:
+        elif all_four_present and not nim_match:
+            result.status = "nim_mismatch"
+        elif not has_qr and (has_nim_ocr or has_nama):
+            result.status = "qr_missing"
+        elif not has_face_photo and (has_nim_ocr or has_nama):
+            result.status = "face_photo_missing"
+        elif result.nim_final or has_nama:
             result.status = "incomplete"
         else:
             result.status = "extraction_failed"
+
+        # Log detail untuk setiap indikator
+        indicators = (
+            f"QR={'✅' if has_qr else '❌'} "
+            f"NIM_OCR={'✅' if has_nim_ocr else '❌'} "
+            f"Nama={'✅' if has_nama else '❌'} "
+            f"Face={'✅' if has_face_photo else '❌'} "
+            f"Match={'✅' if nim_match else '❌'}"
+        )
 
         result.total_time_ms = (time.perf_counter() - t_total_start) * 1000
 
         logger.info(
             f"Pipeline result: {result.status} | "
             f"NIM={result.nim_final} | Name={result.nama} | "
-            f"Match={result.nim_match} | {result.total_time_ms:.0f}ms"
+            f"[{indicators}] | {result.total_time_ms:.0f}ms"
         )
 
         return result

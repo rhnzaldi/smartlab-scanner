@@ -100,12 +100,13 @@ class StabilityTracker:
         self._needs_enrollment = False  # True jika belum ada encoding di DB
         self._face_failed = False       # True jika face verify gagal
         self._name_mismatch = False     # True jika nama OCR beda jauh dengan DB
+        self._scan_rejection_reason = None  # Alasan scan ditolak (qr_missing, nim_mismatch, dll)
 
         # Scan results
         self.last_validated_nim = None
         self.last_validated_name = None
         self.db_result = None
-        self.checkin_result = None
+        self.checkin_result = Nonepython test_webcam.py
         self.face_result = None
 
     def update(self, detected_labels: set) -> bool:
@@ -133,6 +134,7 @@ class StabilityTracker:
         self.consecutive_count = 0
         if phase == ScanPhase.SCANNING:
             self._face_failed = False
+            self._scan_rejection_reason = None
             self._name_mismatch = False
 
     @property
@@ -199,6 +201,7 @@ class StabilityTracker:
         self._face_failed = False
         self._needs_enrollment = False
         self._name_mismatch = False
+        self._scan_rejection_reason = None
 
     def set_checkin_func(self, func):
         """Set the check_in function reference."""
@@ -390,7 +393,20 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
 
     elif phase == ScanPhase.COOLDOWN:
         remaining = stability.phase_remaining
-        if stability._name_mismatch:
+        rejection = stability._scan_rejection_reason
+        if rejection == "qr_missing":
+            draw_badge(display, "QR CODE TIDAK ADA", COLOR_DB_FAIL)
+            draw_center_text(display,
+                f"QR Code tidak terdeteksi! ({remaining:.0f}s)", COLOR_DB_FAIL)
+        elif rejection == "nim_mismatch":
+            draw_badge(display, "NIM TIDAK COCOK", COLOR_DB_FAIL)
+            draw_center_text(display,
+                f"NIM QR Dan OCR Belum Cocok ({remaining:.0f}s)", COLOR_DB_FAIL)
+        elif rejection == "face_photo_missing":
+            draw_badge(display, "FOTO KTM TIDAK ADA", COLOR_DB_FAIL)
+            draw_center_text(display,
+                f"Foto wajah di KTM tidak terdeteksi! ({remaining:.0f}s)", COLOR_DB_FAIL)
+        elif stability._name_mismatch:
             draw_badge(display, "NAMA TIDAK COCOK", COLOR_DB_FAIL)
             draw_center_text(display,
                 f"NAMA TIDAK COCOK — NIM SALAH? ({remaining:.0f}s)", COLOR_DB_FAIL)
@@ -514,8 +530,8 @@ def main():
                     f"{result.total_time_ms:.0f}ms"
                 )
 
-                # ── DB Lookup ──
-                if result.nim_final and result.nama:
+                # ── DB Lookup (hanya jika 4 indikator lengkap + match) ──
+                if result.success:
                     db_res = verify_student(result.nim_final, result.nama)
                     stability.db_result = db_res
                     stability.last_validated_nim = result.nim_final
@@ -557,6 +573,27 @@ def main():
                         logger.warning(f"🚫 {db_res['message']}")
                         # NIM not found — go to cooldown
                         stability.enter_phase(ScanPhase.COOLDOWN)
+
+                elif result.status == "qr_missing":
+                    # KTM tanpa QR code — DITOLAK
+                    logger.warning(
+                        f"🚫 QR Code tidak terdeteksi! NIM OCR={result.nim_ocr}, "
+                        f"Nama={result.nama} — scan DITOLAK (butuh QR)")
+                    stability._scan_rejection_reason = "qr_missing"
+                    stability.enter_phase(ScanPhase.COOLDOWN)
+                elif result.status == "nim_mismatch":
+                    # QR dan OCR beda — DITOLAK
+                    logger.warning(
+                        f"🚫 NIM tidak cocok! QR={result.nim_qr} vs "
+                        f"OCR={result.nim_ocr} — scan DITOLAK")
+                    stability._scan_rejection_reason = "nim_mismatch"
+                    stability.enter_phase(ScanPhase.COOLDOWN)
+                elif result.status == "face_photo_missing":
+                    logger.warning(
+                        f"🚫 Foto wajah pada KTM tidak terdeteksi — "
+                        f"pastikan KTM terlihat jelas!")
+                    stability._scan_rejection_reason = "face_photo_missing"
+                    stability.enter_phase(ScanPhase.COOLDOWN)
 
             except Exception as e:
                 logger.error(f"OCR error: {e}")

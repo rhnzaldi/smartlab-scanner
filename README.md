@@ -153,6 +153,29 @@ python seed_mahasiswa.py
 
 > Langkah ini hanya perlu dilakukan **sekali** saat pertama kali setup. Database `smartlab.db` akan dibuat otomatis.
 
+#### Panduan Menjalankan Seeder
+
+1. **Pastikan Virtual Environment Aktif**: Sebelum menjalankan seeder, pastikan virtual environment sudah diaktifkan. Anda akan melihat `(venv)` di prompt terminal.
+
+   **Windows:**
+   ```bash
+   .\venv\Scripts\activate
+   ```
+
+   **macOS/Linux:**
+   ```bash
+   source venv/bin/activate
+   ```
+
+2. **Jalankan Seeder**: Setelah environment aktif, jalankan perintah berikut:
+   ```bash
+   python seed_mahasiswa.py
+   ```
+
+3. **Verifikasi**: Jika berhasil, Anda akan melihat pesan konfirmasi di terminal. Database `smartlab_db` akan dibuat dengan tabel dan data awal.
+
+> **Catatan**: Jika terjadi error terkait `openpyxl`, pastikan library sudah terinstall dengan `pip install openpyxl`.
+
 ### 6. Mulai Server API
 
 Jalankan FastAPI backend menggunakan server uvicorn:
