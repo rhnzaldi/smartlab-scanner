@@ -19,7 +19,22 @@ numpy>=1.24.0
 
 # === Face Verification ===
 insightface>=0.7.3
+# ─────────────────────────────────────────────────────────────────────────────
+# PILIH SALAH SATU dari 3 opsi onnxruntime di bawah ini.
+# Hapus (comment) dua yang tidak dipakai.
+#
+#  Opsi A — CPU saja (default, semua platform, cocok untuk macOS/Linux):
 onnxruntime>=1.16.0
+#
+#  Opsi B — AMD GPU / Intel GPU / NVIDIA di Windows (via DirectML):
+#  pip install onnxruntime-directml
+#  (Ganti baris onnxruntime di atas dengan baris ini, lalu jalankan:
+#   pip uninstall onnxruntime -y && pip install onnxruntime-directml)
+#
+#  Opsi C — NVIDIA GPU saja (CUDA 11.8 / 12.x):
+#  pip install onnxruntime-gpu
+#  (Ganti baris onnxruntime di atas, pastikan CUDA Toolkit sudah terinstall)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # === Database (MySQL) ===
 PyMySQL>=1.1.0

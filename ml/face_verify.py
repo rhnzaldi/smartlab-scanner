@@ -40,6 +40,41 @@ _face_app = None
 _face_app_available = None
 
 
+def _resolve_onnx_providers() -> list:
+    """
+    Auto-detect provider ONNX Runtime terbaik yang tersedia di sistem.
+    Urutan prioritas:
+      1. CUDAExecutionProvider   → NVIDIA GPU (paling cepat)
+      2. DmlExecutionProvider    → AMD / Intel GPU via Windows DirectML
+      3. CPUExecutionProvider    → Fallback universal (semua platform)
+
+    Provider yang tidak tersedia di sistem akan di-skip secara otomatis.
+    """
+    try:
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+    except Exception:
+        return ['CPUExecutionProvider']
+
+    priority = [
+        ('CUDAExecutionProvider',  '🟢 NVIDIA GPU (CUDA)'),
+        ('DmlExecutionProvider',   '🟡 AMD/Intel GPU (DirectML)'),
+        ('CPUExecutionProvider',   '⚪ CPU (tanpa akselerasi GPU)'),
+    ]
+
+    selected = []
+    for provider, label in priority:
+        if provider in available:
+            selected.append(provider)
+            logger.info(f"[InsightFace] Provider aktif: {label}")
+            if provider != 'CPUExecutionProvider':
+                # Gunakan GPU terbaik + CPU sebagai fallback
+                selected.append('CPUExecutionProvider')
+                break
+
+    return selected if selected else ['CPUExecutionProvider']
+
+
 def _get_face_app():
     """Lazy-load InsightFace FaceAnalysis. Hanya load detection + recognition."""
     global _face_app, _face_app_available
@@ -48,17 +83,21 @@ def _get_face_app():
     if _face_app is None:
         try:
             from insightface.app import FaceAnalysis
+            providers = _resolve_onnx_providers()
             # Hanya load detection + recognition (skip landmark + genderage)
             # Hemat ~100MB RAM, tidak pengaruh akurasi
             _face_app = FaceAnalysis(
                 name='buffalo_l',
-                providers=['CPUExecutionProvider'],
+                providers=providers,
                 allowed_modules=['detection', 'recognition'],
             )
-            # det_size lebih besar = deteksi wajah lebih akurat
-            _face_app.prepare(ctx_id=-1, det_size=(640, 640))
+            # [low-spec] det_size (320,320) lebih ringan dari (640,640)
+            # Akurasi sedikit turun tapi kecepatan naik ~2x di hardware lemah
+            import os
+            det_size = (320, 320) if os.environ.get('SMARTLAB_LOW_SPEC') else (640, 640)
+            _face_app.prepare(ctx_id=-1, det_size=det_size)
             _face_app_available = True
-            logger.info("✅ InsightFace ArcFace loaded (buffalo_l, det_size=640)")
+            logger.info(f"✅ InsightFace ArcFace loaded (buffalo_l, det_size={det_size})")
         except Exception as e:
             logger.error(f"❌ InsightFace gagal dimuat: {e}")
             _face_app_available = False

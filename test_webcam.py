@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Smart-Lab SV IPB — Webcam Test Script (v4: DB Lookup + Lab Borrowing)
+Smart-Lab SV IPB — Webcam Test Script (v5: Low-Spec + DirectML Support)
 
 Architecture:
  - Main thread: YOLO detection setiap frame (~40ms, no lag)
@@ -11,6 +11,8 @@ Architecture:
 Usage:
     python test_webcam.py
     python test_webcam.py --model models/best.pt --camera 1
+    python test_webcam.py --low-spec          # Untuk laptop tanpa GPU / hardware lemah
+    python test_webcam.py --low-spec --width 640 --height 480   # Resolusi lebih rendah
 
 Controls:
     q      = Quit
@@ -106,7 +108,7 @@ class StabilityTracker:
         self.last_validated_nim = None
         self.last_validated_name = None
         self.db_result = None
-        self.checkin_result = Nonepython test_webcam.py
+        self.checkin_result = None
         self.face_result = None
 
     def update(self, detected_labels: set) -> bool:
@@ -421,7 +423,7 @@ def draw_results(frame: np.ndarray, result, conf_threshold: float,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart-Lab KTM Scanner v3")
+    parser = argparse.ArgumentParser(description="Smart-Lab KTM Scanner v5")
     parser.add_argument("--model", default="models/best.pt", help="Path to YOLO model")
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
     parser.add_argument("--confidence", type=float, default=0.35, help="YOLO confidence")
@@ -432,7 +434,49 @@ def main():
                         help="Cooldown after scan (seconds)")
     parser.add_argument("--no-face-verify", action="store_true",
                         help="Disable face verification")
+    parser.add_argument(
+        "--low-spec",
+        action="store_true",
+        help=(
+            "Mode hardware rendah: YOLO interval 150ms, resolusi deteksi wajah 320px, "
+            "QR 3 strategi saja, OCR tanpa angle-cls dan tanpa attempt 2. "
+            "Gunakan ini jika FPS sangat rendah di laptop tanpa GPU."
+        )
+    )
     args = parser.parse_args()
+
+    # ── Aktifkan Low-Spec Mode ──
+    if args.low_spec:
+        os.environ['SMARTLAB_LOW_SPEC'] = '1'
+        logger.info("=" * 55)
+        logger.info("   ⚡ LOW-SPEC MODE AKTIF")
+        logger.info("   - YOLO: deteksi setiap 150ms (bukan setiap frame)")
+        logger.info("   - InsightFace: det_size (320,320) [lebih ringan]")
+        logger.info("   - QR Decode: 3 strategi saja (gray, binary, 2x)")
+        logger.info("   - OCR: use_angle_cls=False, tanpa attempt ke-2")
+        logger.info("=" * 55)
+    else:
+        os.environ.pop('SMARTLAB_LOW_SPEC', None)  # pastikan bersih
+        logger.info("✅ Berjalan dalam mode NORMAL (full-spec).")
+
+    # ── GPU Compatibility Check ──
+    # Cek provider ONNX yang tersedia di sistem ini dan tampilkan status jelas.
+    # Ini membantu pengguna tahu apakah DirectML/CUDA aktif atau tidak,
+    # tanpa harus membaca log yang panjang.
+    try:
+        import onnxruntime as ort
+        available_providers = ort.get_available_providers()
+        if 'CUDAExecutionProvider' in available_providers:
+            logger.info("🟢 GPU Status: NVIDIA CUDA terdeteksi — akselerasi penuh aktif")
+        elif 'DmlExecutionProvider' in available_providers:
+            logger.info("🟡 GPU Status: AMD/Intel DirectML terdeteksi — akselerasi GPU aktif")
+        else:
+            logger.info("⚪ GPU Status: Tidak ada GPU akselerasi — berjalan via CPU")
+            if sys.platform == "win32":
+                logger.info("   ℹ️  Untuk AMD/Intel GPU: pip uninstall onnxruntime -y && pip install onnxruntime-directml")
+                logger.info("   ℹ️  Jika DirectML gagal/tidak kompatibel: pip uninstall onnxruntime-directml -y && pip install onnxruntime")
+    except ImportError:
+        logger.warning("⚠️  onnxruntime tidak terinstall! Jalankan: pip install onnxruntime")
 
     global COOLDOWN_SECONDS
     COOLDOWN_SECONDS = args.cooldown
@@ -610,10 +654,21 @@ def main():
     fps_time = time.time()
     fps = 0.0
 
+    # [low-spec] Interval YOLO: hanya jalankan deteksi setiap N detik
+    # Mode normal  = setiap frame (~33ms @ 30fps)
+    # Mode low-spec = setiap 150ms (maks 7x/detik, hemat CPU)
+    YOLO_INTERVAL = 0.15 if args.low_spec else 0.0
+    last_yolo_time = 0.0
+    last_detections: dict = {}  # Cache hasil deteksi terakhir
+
     logger.info("Starting scan. Press 'q' to quit.")
     print(f"\n  [q] Quit | [s] Save | [SPACE] Pause | [+/-] Confidence")
     print(f"  [o] Force OCR | [c] Check-out | [r] Reset peminjaman")
-    print(f"  [f] Reset face encoding | Stability: {MIN_STABLE_FRAMES} frames\n")
+    print(f"  [f] Reset face encoding | Stability: {MIN_STABLE_FRAMES} frames")
+    if args.low_spec:
+        print(f"  ⚡ LOW-SPEC MODE: YOLO tiap {YOLO_INTERVAL*1000:.0f}ms, OCR dioptimasi\n")
+    else:
+        print()
 
     while True:
         ret, frame = cap.read()
@@ -632,8 +687,13 @@ def main():
             # PATH A: YOLO + OCR (only during SCANNING)
             # ══════════════════════════════════════════════
             if stability.phase == ScanPhase.SCANNING:
-                detections = pipeline.detect(frame)
-                crops = pipeline.crop_detections(frame, detections) if detections else {}
+                # [low-spec] Interval YOLO: skip deteksi jika belum waktunya
+                now = time.time()
+                if now - last_yolo_time >= YOLO_INTERVAL:
+                    detections = pipeline.detect(frame)
+                    last_detections = pipeline.crop_detections(frame, detections) if detections else {}
+                    last_yolo_time = now
+                crops = last_detections
 
                 display_result = ScanResult()
                 display_result.detections_found = list(crops.keys())
