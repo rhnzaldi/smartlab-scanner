@@ -17,7 +17,7 @@ from ml.pipeline import KTMPipeline
 from db.database import init_db
 from core.dependencies import set_pipeline
 
-from routers import auth, scan, face, peminjaman, status, labs, jadwal, reports
+from routers import auth, scan, face, peminjaman, status, labs, jadwal, reports, notifications
 
 # ────────────────────────────────────────────────────────
 # Logging
@@ -82,6 +82,7 @@ app.include_router(status.router, prefix="/api")
 app.include_router(labs.router, prefix="/api")
 app.include_router(jadwal.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(notifications.router, prefix="/api")
 
 # Include scan router tanpa prefix agar /ws/scan dan /api/scan terdaftar sesuai path absolute-nya
 app.include_router(scan.router)

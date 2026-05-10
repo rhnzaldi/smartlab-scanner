@@ -258,6 +258,23 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
 
+            # Notifikasi (admin: permintaan masuk lab; mahasiswa: ACC / tolak / menunggu)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    audience VARCHAR(20) NOT NULL,
+                    nim VARCHAR(20) NULL,
+                    notif_type VARCHAR(40) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    message TEXT NOT NULL,
+                    lab VARCHAR(100) NULL,
+                    data JSON NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_notif_audience_status (audience, status),
+                    INDEX idx_notif_nim_created (nim, id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
 
             # Seed data mahasiswa
             cursor.execute("SELECT COUNT(*) AS cnt FROM mahasiswa")
@@ -460,18 +477,38 @@ def delete_lab(lab_id: int) -> bool:
 # Schedule (Jadwal) Functions
 # ────────────────────────────────────────────────────────
 @_timed_db_op
-def get_jadwal(include_archived: bool = False) -> List[Dict]:
+def get_jadwal(
+    include_archived: bool = False,
+    tipe_semester: Optional[str] = None,
+    tahun_ajaran: Optional[str] = None,
+) -> List[Dict]:
     """Ambil jadwal laboratorium.
 
     Args:
         include_archived: Jika True, kembalikan semua jadwal (termasuk yang diarsipkan).
+        tipe_semester: Filter opsional (mis. Genap).
+        tahun_ajaran: Filter opsional (mis. 2025/2026).
     """
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    if not include_archived:
+        conditions.append("is_archived = FALSE")
+    if tipe_semester:
+        conditions.append("tipe_semester = %s")
+        params.append(tipe_semester)
+    if tahun_ajaran:
+        conditions.append("tahun_ajaran = %s")
+        params.append(tahun_ajaran)
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            if include_archived:
-                cursor.execute("SELECT * FROM jadwal ORDER BY id")
-            else:
-                cursor.execute("SELECT * FROM jadwal WHERE is_archived = FALSE ORDER BY id")
+            cursor.execute(
+                f"SELECT * FROM jadwal WHERE {where_clause} ORDER BY id",
+                tuple(params),
+            )
             jadwal_list = cursor.fetchall()
 
     for jadwal in jadwal_list:
@@ -788,6 +825,10 @@ def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
 
     logger.info(f"⏳ Check-in pending ACC: {nim} → {lab} (ID: {pid})")
     _invalidate_peminjaman_cache()  # [P-02]
+    try:
+        notify_after_check_in(nim, lab, pid)
+    except Exception as exc:
+        logger.warning("Gagal membuat notifikasi check-in: %s", exc)
     return {
         "success": True,
         "message": f"⏳ Verifikasi Wajah Berhasil! Menunggu persetujuan Admin lab.",
@@ -799,46 +840,72 @@ def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
 @_timed_db_op
 def approve_peminjaman(pid: int) -> Dict:
     """Ubah status peminjaman dari 'menunggu' menjadi 'aktif'."""
+    nim_for_notif: Optional[str] = None
+    lab_for_notif: Optional[str] = None
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("UPDATE peminjaman SET status = 'aktif' WHERE id = %s AND status = 'menunggu'", (pid,))
-            if cursor.rowcount == 0:
-                 return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
-            
-            # Fetch lab info of the approved active session
-            cursor.execute("SELECT lab FROM peminjaman WHERE id = %s", (pid,))
-            lab_res = cursor.fetchone()
-            if lab_res:
-                lab = lab_res["lab"]
-                # [JADWAL-01 FIX] Filter hari agar tidak update jadwal di hari yang salah
+            cursor.execute(
+                "SELECT nim, lab FROM peminjaman WHERE id = %s AND status = 'menunggu'",
+                (pid,),
+            )
+            pending = cursor.fetchone()
+            if not pending:
+                return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+            nim_for_notif, lab_for_notif = pending["nim"], pending["lab"]
+
+            cursor.execute(
+                "UPDATE peminjaman SET status = 'aktif' WHERE id = %s AND status = 'menunggu'",
+                (pid,),
+            )
+            if lab_for_notif:
+                lab = lab_for_notif
                 now_str = datetime.now().strftime("%H:%M:%S")
                 hari_ini = _HARI_INDONESIA[datetime.now().weekday()]
                 cursor.execute(
                     "UPDATE jadwal SET status = 'digunakan' WHERE lab = %s AND hari = %s AND jam_mulai <= %s AND jam_selesai >= %s",
-                    (lab, hari_ini, now_str, now_str)
+                    (lab, hari_ini, now_str, now_str),
                 )
-    
+
     logger.info(f"✅ Approve peminjaman ID: {pid}")
     _invalidate_peminjaman_cache()  # [P-02]
+    if nim_for_notif and lab_for_notif:
+        try:
+            notify_after_approve(nim_for_notif, lab_for_notif, pid)
+            notify_admin_after_approve(nim_for_notif, lab_for_notif, pid)
+        except Exception as exc:
+            logger.warning("Gagal notifikasi approve: %s", exc)
     return {"success": True, "message": "Peminjaman disetujui (Aktif)."}
 
 @_timed_db_op
 def reject_peminjaman(pid: int) -> Dict:
     """Tolak peminjaman, ubah status dari 'menunggu' menjadi 'ditolak'."""
+    nim_for_notif: Optional[str] = None
+    lab_for_notif: Optional[str] = None
     with get_connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT nim, lab FROM peminjaman WHERE id = %s AND status = 'menunggu'",
+                (pid,),
+            )
+            pending = cursor.fetchone()
+            if not pending:
+                return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
+            nim_for_notif, lab_for_notif = pending["nim"], pending["lab"]
+
             now = datetime.now().strftime(TIMESTAMP_FORMAT)
             cursor.execute(
-                "UPDATE peminjaman SET status = 'ditolak', waktu_keluar = %s WHERE id = %s AND status = 'menunggu'", 
-                (now, pid)
+                "UPDATE peminjaman SET status = 'ditolak', waktu_keluar = %s WHERE id = %s AND status = 'menunggu'",
+                (now, pid),
             )
-            if cursor.rowcount == 0:
-                 return {"success": False, "message": "Peminjaman tidak ditemukan atau sudah aktif/selesai."}
-                 
-            # Note: No need to update jadwal status to digunakan on reject, it stays tersedia/menunggu.
-    
+
     logger.warning(f"❌ Reject peminjaman ID: {pid}")
     _invalidate_peminjaman_cache()  # [P-02]
+    if nim_for_notif and lab_for_notif:
+        try:
+            notify_after_reject(nim_for_notif, lab_for_notif, pid)
+            notify_admin_after_reject(nim_for_notif, lab_for_notif, pid)
+        except Exception as exc:
+            logger.warning("Gagal notifikasi reject: %s", exc)
     return {"success": True, "message": "Peminjaman ditolak."}
 
 
@@ -993,6 +1060,207 @@ def get_peminjaman_history(
             query += " ORDER BY p.waktu_masuk DESC"
             cursor.execute(query, tuple(params))
             return cursor.fetchall()
+
+
+# ────────────────────────────────────────────────────────
+# Notifications (admin + mahasiswa)
+# ────────────────────────────────────────────────────────
+def _lookup_mahasiswa_nama(nim: str) -> Optional[str]:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT nama FROM mahasiswa WHERE nim = %s", (nim,))
+            row = cursor.fetchone()
+            return row["nama"] if row else None
+
+
+def _notification_row_to_dict(row: Dict) -> Dict[str, Any]:
+    data = row.get("data")
+    parsed: Any = None
+    if data is None:
+        parsed = None
+    elif isinstance(data, dict):
+        parsed = data
+    elif isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+        except Exception:
+            parsed = None
+    else:
+        try:
+            parsed = json.loads(str(data))
+        except Exception:
+            parsed = None
+    created = row.get("created_at")
+    if isinstance(created, datetime):
+        created_str = created.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        created_str = str(created) if created else ""
+    return {
+        "id": row["id"],
+        "type": row["notif_type"],
+        "title": row["title"],
+        "message": row["message"],
+        "status": row["status"],
+        "created_at": created_str,
+        "lab": row.get("lab"),
+        "data": parsed,
+    }
+
+
+def _insert_notification_row(
+    audience: str,
+    nim: Optional[str],
+    notif_type: str,
+    title: str,
+    message: str,
+    lab: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload = json.dumps(data, ensure_ascii=False) if data else None
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO notifications (audience, nim, notif_type, title, message, lab, data, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+                """,
+                (audience, nim, notif_type, title, message, lab, payload),
+            )
+
+
+def notify_after_check_in(nim: str, lab: str, peminjaman_id: int) -> None:
+    nama = _lookup_mahasiswa_nama(nim) or nim
+    _insert_notification_row(
+        "admin",
+        None,
+        "booking_request",
+        "Permintaan masuk laboratorium",
+        f"{nama} ({nim}) meminta akses ke {lab}. Proses ACC atau tolak di dashboard.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/adminlab/dashboard"},
+    )
+    _insert_notification_row(
+        "mahasiswa",
+        nim,
+        "booking_pending",
+        "Menunggu persetujuan admin",
+        f"Permintaan masuk {lab} telah dikirim. Anda akan menerima notifikasi setelah admin memutuskan.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/jadwal"},
+    )
+
+
+def notify_after_approve(nim: str, lab: str, peminjaman_id: int) -> None:
+    _insert_notification_row(
+        "mahasiswa",
+        nim,
+        "booking_approved",
+        "Peminjaman disetujui",
+        f"Anda diizinkan masuk {lab}. Silakan lanjutkan aktivitas di laboratorium.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/jadwal"},
+    )
+
+
+def notify_after_reject(nim: str, lab: str, peminjaman_id: int) -> None:
+    _insert_notification_row(
+        "mahasiswa",
+        nim,
+        "booking_rejected",
+        "Peminjaman ditolak",
+        f"Permintaan masuk {lab} ditolak oleh admin. Hubungi petugas jika perlu penjelasan.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/jadwal"},
+    )
+
+
+def notify_admin_after_approve(nim: str, lab: str, peminjaman_id: int) -> None:
+    """Konfirmasi di sisi admin: ACC tercatat (UX + jejak singkat)."""
+    nama = _lookup_mahasiswa_nama(nim) or nim
+    _insert_notification_row(
+        "admin",
+        None,
+        "admin_action_approve",
+        "ACC peminjaman",
+        f"Anda menyetujui {nama} ({nim}) masuk {lab}. Mahasiswa telah menerima notifikasi disetujui.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/adminlab/dashboard"},
+    )
+
+
+def notify_admin_after_reject(nim: str, lab: str, peminjaman_id: int) -> None:
+    """Konfirmasi di sisi admin: penolakan tercatat."""
+    nama = _lookup_mahasiswa_nama(nim) or nim
+    _insert_notification_row(
+        "admin",
+        None,
+        "admin_action_reject",
+        "Penolakan peminjaman",
+        f"Anda menolak permintaan {nama} ({nim}) untuk {lab}. Mahasiswa telah menerima notifikasi penolakan.",
+        lab,
+        {"peminjaman_id": peminjaman_id, "href": "/adminlab/dashboard"},
+    )
+
+
+@_timed_db_op
+def get_notifications_admin(limit: int = 80) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM notifications
+                WHERE audience = 'admin'
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+    return [_notification_row_to_dict(r) for r in rows]
+
+
+@_timed_db_op
+def get_notifications_mahasiswa(nim: str, limit: int = 80) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM notifications
+                WHERE audience = 'mahasiswa' AND UPPER(nim) = UPPER(%s)
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (nim, limit),
+            )
+            rows = cursor.fetchall()
+    return [_notification_row_to_dict(r) for r in rows]
+
+
+@_timed_db_op
+def mark_notification_done_for_user(notif_id: int, role: str, username: str) -> Dict[str, Any]:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, audience, nim FROM notifications WHERE id = %s",
+                (notif_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {"success": False, "message": "Notifikasi tidak ditemukan."}
+            aud = row["audience"]
+            if aud == "admin":
+                if role != "admin":
+                    return {"success": False, "message": "Akses ditolak."}
+            elif aud == "mahasiswa":
+                if role != "mahasiswa" or (row["nim"] or "").upper() != (username or "").upper():
+                    return {"success": False, "message": "Akses ditolak."}
+            else:
+                return {"success": False, "message": "Jenis notifikasi tidak dikenal."}
+            cursor.execute(
+                "UPDATE notifications SET status = 'done' WHERE id = %s",
+                (notif_id,),
+            )
+    return {"success": True, "message": "Notifikasi ditandai selesai."}
 
 
 # ────────────────────────────────────────────────────────
