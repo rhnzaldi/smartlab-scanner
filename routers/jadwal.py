@@ -25,8 +25,12 @@ async def api_get_jadwal(archived: bool = False):
     return await asyncio.to_thread(get_jadwal, archived)
 
 @router.get("/public/jadwal")
-async def api_public_jadwal(archived: bool = False):
-    return await asyncio.to_thread(get_jadwal, archived)
+async def api_public_jadwal(
+    archived: bool = False,
+    tipe_semester: Optional[str] = None,
+    tahun_ajaran: Optional[str] = None,
+):
+    return await asyncio.to_thread(get_jadwal, archived, tipe_semester, tahun_ajaran)
 
 @router.post("/jadwal", dependencies=[Depends(get_current_admin)])
 async def api_create_jadwal(payload: SchedulePayload):

@@ -7,6 +7,23 @@ from core.dependencies import get_current_admin
 
 router = APIRouter(tags=["Labs"])
 
+
+@router.get("/public/labs")
+async def api_public_labs():
+    """Daftar lab untuk halaman publik (tanpa auth): nama, lokasi, jam ops, status maintenance."""
+    rows = await asyncio.to_thread(get_labs)
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "location": r["location"],
+            "op_start": r.get("op_start"),
+            "op_end": r.get("op_end"),
+            "status_override": r.get("status_override"),
+        }
+        for r in rows
+    ]
+
 class LabPayload(BaseModel):
     name: str
     location: Optional[str] = None
