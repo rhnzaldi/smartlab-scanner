@@ -118,10 +118,11 @@ def deskew(img: np.ndarray, max_angle: float = 10.0) -> np.ndarray:
     return rotated
 
 
-def resize_for_ocr(img: np.ndarray, min_height: int = 100) -> np.ndarray:
+def resize_for_ocr(img: np.ndarray, min_height: int = 150) -> np.ndarray:
     """
     Upscale crop yang terlalu kecil untuk OCR.
-    PaddleOCR membutuhkan minimal ~64px,  min 100px untuk akurasi optimal.
+    PaddleOCR membutuhkan minimal ~64px, min 150px untuk akurasi optimal
+    (dinaikkan dari 100px agar webcam kualitas rendah masih terbaca).
     Aspect ratio dijaga.
     """
     h, w = img.shape[:2]

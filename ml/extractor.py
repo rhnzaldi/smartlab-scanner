@@ -133,13 +133,18 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
     _, bin_2x = cv2.threshold(gray_2x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     if is_low_spec:
-        # [low-spec] Hanya 3 strategi tercepat — skip CLAHE dan 3x upscale
+        # [low-spec] 5 strategi — tambah binary_inv dan CLAHE untuk webcam kualitas rendah
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        gray_clahe = clahe.apply(gray)
+        _, bin_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         strategies = [
-            ("gray",      gray),
-            ("binary",    binary),
-            ("2x_binary", bin_2x),
+            ("gray",         gray),
+            ("binary",       binary),
+            ("binary_inv",   binary_inv),
+            ("2x_binary",    bin_2x),
+            ("clahe_binary", bin_clahe),
         ]
-        logger.debug("QR: low-spec mode — 3 strategies only")
+        logger.debug("QR: low-spec mode — 5 strategies")
     else:
         # CLAHE variant (normalisasi kontras lokal) — hanya di mode normal
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
@@ -185,7 +190,8 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
 # OCR Text Extraction
 # ────────────────────────────────────────────────────────
 
-_OCR_CONFIDENCE_THRESHOLD = 0.55  # Abaikan teks dengan confidence < ini
+_OCR_CONFIDENCE_THRESHOLD = 0.55       # Threshold normal
+_OCR_CONFIDENCE_THRESHOLD_LOW = 0.35   # Threshold low-spec (webcam buram/gelap)
 
 
 def _run_ocr_on(img: np.ndarray) -> Optional[str]:
@@ -207,16 +213,20 @@ def _run_ocr_on(img: np.ndarray) -> Optional[str]:
         if not results:
             return None
 
+        # [low-spec] Gunakan threshold lebih rendah untuk webcam berkualitas rendah
+        is_low_spec = bool(os.environ.get('SMARTLAB_LOW_SPEC'))
+        threshold = _OCR_CONFIDENCE_THRESHOLD_LOW if is_low_spec else _OCR_CONFIDENCE_THRESHOLD
+
         texts = []
         for result_item in results:
             rec_texts  = result_item.get("rec_texts", [])
             rec_scores = result_item.get("rec_scores", [])
             for text, score in zip(rec_texts, rec_scores):
-                if score >= _OCR_CONFIDENCE_THRESHOLD:
+                if score >= threshold:
                     texts.append(text)
-                    logger.debug(f"  OCR line accepted: '{text}' (conf: {score:.2f})")
+                    logger.debug(f"  OCR line accepted: '{text}' (conf: {score:.2f}, thr: {threshold})")
                 else:
-                    logger.debug(f"  OCR line rejected (low conf {score:.2f}): '{text}'")
+                    logger.debug(f"  OCR line rejected (low conf {score:.2f} < {threshold}): '{text}'")
 
         combined = " ".join(texts).strip()
         return combined if combined else None
@@ -254,13 +264,8 @@ def extract_text_ocr(img: np.ndarray) -> Optional[str]:
         logger.info(f"OCR result (attempt 1): '{result}'")
         return result
 
-    # [low-spec] Skip attempt 2 jika mode low-spec aktif
-    # Alasan: attempt 2 membutuhkan waktu sama dengan attempt 1 (~800ms)
-    # Jika attempt 1 gagal di hardware lambat, attempt 2 jarang membantu secara signifikan
-    if is_low_spec:
-        logger.debug("OCR: low-spec mode — skip attempt 2")
-        logger.warning("⚠️ OCR returned no confident text (low-spec mode, attempt 1 only).")
-        return None
+    # [low-spec] Tetap coba attempt 2 (grayscale + upscale) karena webcam murah
+    # sering menghasilkan gambar buram yang butuh preprocessing berbeda
 
     # Attempt 2: grayscale saja (tanpa CLAHE/sharpen) — hanya di mode normal
     if len(img.shape) == 3:
