@@ -2,16 +2,11 @@
 Smart-Lab SV IPB — Text & QR Extractor
 PaddleOCR untuk teks NIM/Nama, pyzbar + cv2.QRCodeDetector untuk QR Code.
 
-Changelog v2:
-  - QR: tambah upscale 2x/3x, tambah cv2.QRCodeDetector fallback, tambah CLAHE strategy
-  - OCR: tambah confidence filter (score > 0.55), tambah use_angle_cls=True
-  - OCR: multi-attempt (preprocessed → grayscale → color)
-
-Changelog v3 [coba-low-spec branch]:
-  - QR: kurangi strategi dari 9 ke 6 (hapus 3x upscale yang berat)
-  - QR: mode low-spec hanya 3 strategi tercepat
-  - OCR: skip attempt 2 (grayscale fallback) jika attempt 1 sudah berhasil
-  - OCR: mode low-spec matikan use_angle_cls untuk hemat waktu inference
+Pipeline:
+  - QR  : 5 strategi preprocessing (gray, binary, binary_inv, 2x, CLAHE)
+           + 2 fallback cv2.QRCodeDetector (gray, binary, 2x)
+  - OCR : PaddleOCR dengan use_angle_cls=True dan confidence threshold 0.55
+           Multi-attempt: preprocessed → grayscale fallback
 """
 
 import logging
@@ -42,18 +37,13 @@ def _get_paddle_ocr():
         return None
     if _paddle_ocr_instance is None:
         try:
-            import os
-            is_low_spec = bool(os.environ.get('SMARTLAB_LOW_SPEC'))
-            # [low-spec] Matikan use_angle_cls — hemat ~200ms per panggilan OCR
-            # Trade-off: teks yang agak miring mungkin tidak terbaca sempurna
-            use_angle = not is_low_spec
-            logger.info(f"⏳ Loading PaddleOCR (use_angle_cls={use_angle})...")
+            logger.info("⏳ Loading PaddleOCR (use_angle_cls=True)...")
             from paddleocr import PaddleOCR
             _paddle_ocr_instance = PaddleOCR(
                 lang="en",
-                use_angle_cls=use_angle,
+                use_angle_cls=True,
             )
-            logger.info(f"✅ PaddleOCR loaded (use_angle_cls={use_angle}, low_spec={is_low_spec}).")
+            logger.info("✅ PaddleOCR loaded (use_angle_cls=True).")
         except Exception as e:
             logger.error(f"❌ PaddleOCR init failed: {e}")
             _paddle_ocr_init_failed = True
@@ -102,61 +92,48 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
     Decode QR code dari image crop.
 
     Strategi (dicoba berurutan, berhenti saat salah satu berhasil):
-      1. Grayscale asli (sudah diupscale dari pipeline)
-      2. OTSU binary
-      3. OTSU inverted
-      4. Upscale 2× + OTSU binary
-      5. Upscale 3× + OTSU binary
-      6. CLAHE + OTSU (untuk QR dengan kontras rendah)
-      7. cv2.QRCodeDetector fallback (grayscale & binary)
+      pyzbar:
+        1. Grayscale asli
+        2. OTSU binary
+        3. OTSU inverted
+        4. Upscale 2× + OTSU binary
+        5. CLAHE + OTSU (untuk QR dengan kontras rendah)
+      cv2.QRCodeDetector fallback:
+        6. Grayscale
+        7. OTSU binary
+        8. Grayscale 2×
 
     Input: bisa grayscale atau BGR — fungsi ini normalize sendiri.
     """
     pyzbar_decode = _get_pyzbar_decode()
 
-    # Normalize ke grayscale dulu
+    # Normalize ke grayscale
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img.copy()
 
-    import os
-    is_low_spec = bool(os.environ.get('SMARTLAB_LOW_SPEC'))
-
-    # Hitung threshold OTSU sekali pakai
+    # Threshold OTSU
     _, binary     = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     binary_inv    = cv2.bitwise_not(binary)
 
-    # Upscale 2x (skip 3x di semua mode — terlalu mahal, jarang membantu)
+    # Upscale 2×
     h, w = gray.shape
     gray_2x  = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
     _, bin_2x = cv2.threshold(gray_2x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    if is_low_spec:
-        # [low-spec] 5 strategi — tambah binary_inv dan CLAHE untuk webcam kualitas rendah
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-        gray_clahe = clahe.apply(gray)
-        _, bin_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        strategies = [
-            ("gray",         gray),
-            ("binary",       binary),
-            ("binary_inv",   binary_inv),
-            ("2x_binary",    bin_2x),
-            ("clahe_binary", bin_clahe),
-        ]
-        logger.debug("QR: low-spec mode — 5 strategies")
-    else:
-        # CLAHE variant (normalisasi kontras lokal) — hanya di mode normal
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-        gray_clahe = clahe.apply(gray)
-        _, bin_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        strategies = [
-            ("gray",          gray),
-            ("binary",        binary),
-            ("binary_inv",    binary_inv),
-            ("2x_binary",     bin_2x),
-            ("clahe_binary",  bin_clahe),
-        ]
+    # CLAHE (normalisasi kontras lokal — membantu QR kontras rendah)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    gray_clahe = clahe.apply(gray)
+    _, bin_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    strategies = [
+        ("gray",         gray),
+        ("binary",       binary),
+        ("binary_inv",   binary_inv),
+        ("2x_binary",    bin_2x),
+        ("clahe_binary", bin_clahe),
+    ]
 
     # ── pyzbar strategies ──
     if pyzbar_decode is not None:
@@ -173,10 +150,7 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
             logger.debug(f"pyzbar error: {e}")
 
     # ── cv2.QRCodeDetector fallback ──
-    cv2_fallbacks = [("cv2_gray", gray), ("cv2_binary", binary)]
-    if not is_low_spec:
-        cv2_fallbacks.append(("cv2_2x", gray_2x))  # skip di low-spec
-    for name, processed in cv2_fallbacks:
+    for name, processed in [("cv2_gray", gray), ("cv2_binary", binary), ("cv2_2x", gray_2x)]:
         data = _try_cv2_qr_decode(processed)
         if data:
             logger.info(f"QR decoded via cv2 [{name}]: '{data}'")
@@ -190,8 +164,7 @@ def extract_qr(img: np.ndarray) -> Optional[str]:
 # OCR Text Extraction
 # ────────────────────────────────────────────────────────
 
-_OCR_CONFIDENCE_THRESHOLD = 0.55       # Threshold normal
-_OCR_CONFIDENCE_THRESHOLD_LOW = 0.35   # Threshold low-spec (webcam buram/gelap)
+_OCR_CONFIDENCE_THRESHOLD = 0.55
 
 
 def _run_ocr_on(img: np.ndarray) -> Optional[str]:
@@ -213,20 +186,16 @@ def _run_ocr_on(img: np.ndarray) -> Optional[str]:
         if not results:
             return None
 
-        # [low-spec] Gunakan threshold lebih rendah untuk webcam berkualitas rendah
-        is_low_spec = bool(os.environ.get('SMARTLAB_LOW_SPEC'))
-        threshold = _OCR_CONFIDENCE_THRESHOLD_LOW if is_low_spec else _OCR_CONFIDENCE_THRESHOLD
-
         texts = []
         for result_item in results:
             rec_texts  = result_item.get("rec_texts", [])
             rec_scores = result_item.get("rec_scores", [])
             for text, score in zip(rec_texts, rec_scores):
-                if score >= threshold:
+                if score >= _OCR_CONFIDENCE_THRESHOLD:
                     texts.append(text)
-                    logger.debug(f"  OCR line accepted: '{text}' (conf: {score:.2f}, thr: {threshold})")
+                    logger.debug(f"  OCR line accepted: '{text}' (conf: {score:.2f})")
                 else:
-                    logger.debug(f"  OCR line rejected (low conf {score:.2f} < {threshold}): '{text}'")
+                    logger.debug(f"  OCR line rejected (low conf {score:.2f} < {_OCR_CONFIDENCE_THRESHOLD}): '{text}'")
 
         combined = " ".join(texts).strip()
         return combined if combined else None
@@ -241,9 +210,8 @@ def extract_text_ocr(img: np.ndarray) -> Optional[str]:
     Ekstrak teks dari image crop menggunakan PaddleOCR.
 
     Multi-attempt (fallback jika attempt sebelumnya gagal):
-      1. Input yang diterima (biasanya sudah preprocessed: CLAHE + sharpen)
-      2. Grayscale mentah (tanpa preprocessing tambahan)
-      3. Image color asli BGR (PaddleOCR kadang lebih baik dengan color)
+      1. Input yang diterima (sudah preprocessed: CLAHE + sharpen dari pipeline)
+      2. Grayscale mentah + upscale jika crop terlalu kecil
 
     Returns: teks gabungan semua baris, atau None.
     """
@@ -255,25 +223,14 @@ def extract_text_ocr(img: np.ndarray) -> Optional[str]:
         logger.debug(f"  Image too small for OCR: {w}x{h}")
         return None
 
-    import os
-    is_low_spec = bool(os.environ.get('SMARTLAB_LOW_SPEC'))
-
-    # Attempt 1: gunakan img yang sudah masuk (sudah preprocessed dari pipeline)
+    # Attempt 1: preprocessed image (CLAHE + sharpen dari pipeline)
     result = _run_ocr_on(img)
     if result:
         logger.info(f"OCR result (attempt 1): '{result}'")
         return result
 
-    # [low-spec] Tetap coba attempt 2 (grayscale + upscale) karena webcam murah
-    # sering menghasilkan gambar buram yang butuh preprocessing berbeda
-
-    # Attempt 2: grayscale saja (tanpa CLAHE/sharpen) — hanya di mode normal
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img
-
-    # Upscale jika perlu untuk grayscale fallback
+    # Attempt 2: grayscale mentah + upscale kecil jika crop pendek
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     gh, gw = gray.shape
     if gh < 64:
         scale = 64 / gh

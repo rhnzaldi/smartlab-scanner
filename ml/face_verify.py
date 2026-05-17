@@ -91,13 +91,9 @@ def _get_face_app():
                 providers=providers,
                 allowed_modules=['detection', 'recognition'],
             )
-            # [low-spec] det_size (320,320) lebih ringan dari (640,640)
-            # Akurasi sedikit turun tapi kecepatan naik ~2x di hardware lemah
-            import os
-            det_size = (320, 320) if os.environ.get('SMARTLAB_LOW_SPEC') else (640, 640)
-            _face_app.prepare(ctx_id=-1, det_size=det_size)
+            _face_app.prepare(ctx_id=-1, det_size=(640, 640))
             _face_app_available = True
-            logger.info(f"✅ InsightFace ArcFace loaded (buffalo_l, det_size={det_size})")
+            logger.info("✅ InsightFace ArcFace loaded (buffalo_l, det_size=640x640)")
         except Exception as e:
             logger.error(f"❌ InsightFace gagal dimuat: {e}")
             _face_app_available = False
