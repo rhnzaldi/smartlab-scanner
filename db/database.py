@@ -18,7 +18,7 @@ import functools
 import time
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from difflib import SequenceMatcher
 
@@ -476,6 +476,36 @@ def delete_lab(lab_id: int) -> bool:
 # ────────────────────────────────────────────────────────
 # Schedule (Jadwal) Functions
 # ────────────────────────────────────────────────────────
+
+# Mahasiswa boleh scan mulai 1 jam sebelum jadwal dimulai
+LAB_EARLY_WINDOW_MINUTES = int(os.environ.get("LAB_EARLY_WINDOW_MINUTES", "60"))
+
+
+def get_current_lab() -> Optional[str]:
+    """Deteksi nama lab dari jadwal yang aktif atau akan segera dimulai.
+
+    Window waktu: mulai ``LAB_EARLY_WINDOW_MINUTES`` menit sebelum
+    ``jam_mulai`` hingga ``jam_selesai``.  Jika tidak ada jadwal
+    yang cocok, kembalikan None.
+    """
+    hari_ini = _HARI_INDONESIA[datetime.now().weekday()]
+    now_str = datetime.now().strftime("%H:%M:%S")
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT lab FROM jadwal "
+                "WHERE hari = %s "
+                "AND SUBTIME(jam_mulai, SEC_TO_TIME(%s * 60)) <= %s "
+                "AND jam_selesai >= %s "
+                "AND is_archived = FALSE "
+                "ORDER BY jam_mulai LIMIT 1",
+                (hari_ini, LAB_EARLY_WINDOW_MINUTES, now_str, now_str),
+            )
+            row = cursor.fetchone()
+    return row["lab"] if row else None
+
+
+
 @_timed_db_op
 def get_jadwal(
     include_archived: bool = False,
@@ -793,10 +823,11 @@ def has_active_peminjaman(nim: str) -> bool:
 
 
 @_timed_db_op
-def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
+def check_in(nim: str, lab: str = DEFAULT_LAB, ktm_image: Optional[str] = None) -> Dict:
     """
     Catat mahasiswa masuk lab.
     Sesi awal berstatus 'menunggu' (harus di-ACC admin).
+    ktm_image: path gambar KTM hasil scan (opsional), e.g. '/captures/nim_timestamp.jpg'
     """
     with get_connection() as conn:
         with conn.cursor() as cursor:
@@ -815,13 +846,15 @@ def check_in(nim: str, lab: str = DEFAULT_LAB) -> Dict:
                     "peminjaman_id": active["id"],
                 }
 
-            # Insert peminjaman baru (status 'menunggu')
+            # Insert peminjaman baru (status 'menunggu'), sertakan ktm_image jika ada
             now = datetime.now().strftime(TIMESTAMP_FORMAT)
             cursor.execute(
-                "INSERT INTO peminjaman (nim, lab, waktu_masuk, status) VALUES (%s, %s, %s, 'menunggu')",
-                (nim, lab, now)
+                "INSERT INTO peminjaman (nim, lab, waktu_masuk, status, ktm_image) VALUES (%s, %s, %s, 'menunggu', %s)",
+                (nim, lab, now, ktm_image)
             )
             pid = cursor.lastrowid
+
+
 
     logger.info(f"⏳ Check-in pending ACC: {nim} → {lab} (ID: {pid})")
     _invalidate_peminjaman_cache()  # [P-02]
@@ -984,7 +1017,9 @@ def get_active_peminjaman() -> List[Dict]:
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT p.*, m.nama
+                SELECT p.id, p.nim, p.lab, p.waktu_masuk, p.waktu_keluar,
+                       p.status, p.scan_confidence, p.catatan, p.ktm_image,
+                       m.nama
                 FROM peminjaman p
                 JOIN mahasiswa m ON p.nim = m.nim
                 WHERE p.status IN ('aktif', 'menunggu')

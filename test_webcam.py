@@ -212,10 +212,15 @@ class StabilityTracker:
     def _do_checkin(self):
         """Execute check-in if NIM available."""
         nim = self.last_validated_nim
-        if nim and hasattr(self, '_checkin_func'):
-            ci_res = self._checkin_func(nim)
+        if nim and hasattr(self, '_checkin_func') and hasattr(self, '_get_lab_func'):
+            lab = self._get_lab_func()
+            if not lab:
+                logger.warning("⚠️ Tidak ada jadwal lab aktif saat ini — check-in dilewati.")
+                self.checkin_result = {"success": False, "message": "Tidak ada jadwal lab aktif."}
+                return
+            ci_res = self._checkin_func(nim, lab)
             self.checkin_result = ci_res
-            logger.info(f"🏫 {ci_res['message']}")
+            logger.info(f"🏫 [{lab}] {ci_res['message']}")
 
 
 def draw_center_text(display, msg, color, y_offset=0):
@@ -501,6 +506,7 @@ def main():
     from db.database import (
         init_db, verify_student, check_in, check_out,
         reset_all_peminjaman, save_face_encoding, load_face_encoding,
+        get_current_lab,
     )
     init_db()
 
@@ -536,6 +542,7 @@ def main():
     # ──────────────────────────────────────────────────
     stability = StabilityTracker(face_verify_enabled=(face_verifier is not None))
     stability.set_checkin_func(check_in)
+    stability._get_lab_func = get_current_lab
     ocr_lock = threading.Lock()
     ocr_cached = ScanResult()
     ocr_busy = False

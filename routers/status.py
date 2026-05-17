@@ -1,6 +1,6 @@
 import asyncio
 from fastapi import APIRouter, Depends
-from db.database import get_active_peminjaman
+from db.database import get_active_peminjaman, get_current_lab
 from core.dependencies import get_current_admin
 
 router = APIRouter(tags=["Status"])
@@ -28,3 +28,8 @@ async def api_public_status():
         "peminjaman": active,
         "peminjaman_pending": pending
     }
+
+@router.get("/public/current_lab")
+async def api_public_current_lab():
+    lab = await asyncio.to_thread(get_current_lab)
+    return {"lab": lab}

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from db.database import verify_student, load_face_encoding, save_face_encoding, delete_face_encoding, check_in
+from db.database import verify_student, load_face_encoding, save_face_encoding, delete_face_encoding, check_in, get_current_lab
 from core.dependencies import get_current_student, get_current_admin, get_face_verifier, get_face_lock
 from core.utils import validate_nim
 from routers.scan import decode_base64_image
@@ -16,6 +16,7 @@ class FaceRequest(BaseModel):
     nim: str
     nama: Optional[str] = None
     image_base64: str
+    ktm_image: Optional[str] = None  # URL gambar KTM hasil scan, dikirim dari frontend
 
 class FaceResponse(BaseModel):
     status: str
@@ -80,7 +81,13 @@ async def api_face_enroll(req: FaceRequest, current_user: dict = Depends(get_cur
         })
 
     await asyncio.to_thread(save_face_encoding, nim, enroll_res["encoding"])
-    ci = await asyncio.to_thread(check_in, nim)
+    lab = await asyncio.to_thread(get_current_lab)
+    if not lab:
+        raise HTTPException(
+            status_code=425,
+            detail="Tidak ada jadwal lab yang aktif saat ini. Anda belum bisa melakukan scan.",
+        )
+    ci = await asyncio.to_thread(check_in, nim, lab, req.ktm_image)
 
     return FaceResponse(
         status="enrolled",
@@ -140,7 +147,13 @@ async def api_face_verify(req: FaceRequest, current_user: dict = Depends(get_cur
         )
 
     if verify_res["verified"]:
-        ci = await asyncio.to_thread(check_in, nim)
+        lab = await asyncio.to_thread(get_current_lab)
+        if not lab:
+            raise HTTPException(
+                status_code=425,
+                detail="Wajah terverifikasi, tapi belum ada jadwal lab yang aktif saat ini. Anda belum bisa melakukan scan.",
+            )
+        ci = await asyncio.to_thread(check_in, nim, lab, req.ktm_image)
         
         if not ci.get("success"):
             raise HTTPException(

@@ -12,6 +12,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from ml.pipeline import KTMPipeline
 from db.database import init_db
@@ -32,6 +33,9 @@ ALLOWED_ORIGINS = os.environ.get(
     "CORS_ORIGINS",
     "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
 ).split(",")
+
+CAPTURES_DIR = os.path.join(os.path.dirname(__file__), "captures")
+os.makedirs(CAPTURES_DIR, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,6 +90,9 @@ app.include_router(notifications.router, prefix="/api")
 
 # Include scan router tanpa prefix agar /ws/scan dan /api/scan terdaftar sesuai path absolute-nya
 app.include_router(scan.router)
+
+# Serve gambar hasil scan KTM sebagai static files
+app.mount("/captures", StaticFiles(directory=CAPTURES_DIR), name="captures")
 
 if __name__ == "__main__":
     import uvicorn

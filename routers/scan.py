@@ -1,8 +1,10 @@
 import base64
 import json
 import logging
+import os
 import time
 import asyncio
+from datetime import datetime
 import numpy as np
 import cv2
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException, Depends, Query
@@ -10,7 +12,7 @@ from jose import JWTError
 
 from security import decode_token
 from ml.pipeline import ScanResult
-from db.database import verify_student, has_active_peminjaman, has_face_encoding, get_user_by_username
+from db.database import verify_student, has_active_peminjaman, has_face_encoding, get_user_by_username, get_current_lab
 from core.dependencies import get_pipeline
 
 logger = logging.getLogger("smartlab-api")
@@ -19,6 +21,24 @@ router = APIRouter(tags=["Scan"])
 MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 WS_MIN_INTERVAL_MS = 300
+
+# Folder penyimpanan hasil capture KTM
+CAPTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "captures")
+os.makedirs(CAPTURES_DIR, exist_ok=True)
+
+def save_ktm_capture(frame, nim: str) -> str | None:
+    """Simpan frame KTM ke folder captures/ dan kembalikan path URL-nya."""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{nim}_{timestamp}.jpg"
+        filepath = os.path.join(CAPTURES_DIR, filename)
+        # Kompres sedikit agar tidak terlalu besar (quality 85)
+        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        logger.info(f"📸 KTM capture saved: {filename}")
+        return f"/captures/{filename}"
+    except Exception as e:
+        logger.warning(f"Gagal menyimpan capture KTM: {e}")
+        return None
 
 def decode_base64_image(data: str):
     try:
@@ -78,6 +98,14 @@ async def scan_image(file: UploadFile = File(...), current_user: dict = Depends(
     if not pipeline or not pipeline.is_ready():
         raise HTTPException(status_code=503, detail="ML pipeline not ready.")
 
+    # Cek jadwal aktif sebelum proses apapun
+    lab = await asyncio.to_thread(get_current_lab)
+    if not lab:
+        raise HTTPException(
+            status_code=425,
+            detail="Tidak ada jadwal lab yang aktif saat ini. Anda tidak dapat melakukan scan.",
+        )
+
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File terlalu besar.")
@@ -91,6 +119,14 @@ async def scan_image(file: UploadFile = File(...), current_user: dict = Depends(
     result = pipeline.process_frame(frame)
     response = _process_scan_result(result)
     response["processing_time_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
+
+    # Simpan gambar KTM jika scan berhasil dan terverifikasi di DB
+    if result.success and response.get("db_verified"):
+        nim = result.nim_final
+        ktm_image_url = await asyncio.to_thread(save_ktm_capture, frame, nim)
+        if ktm_image_url:
+            response["ktm_image"] = ktm_image_url
+
     return response
 
 

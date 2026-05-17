@@ -57,6 +57,11 @@ captures/
 aturan pengingat*.md
 
 
+# ── Draft Jurnal (file lokal, jangan push) ──
 Draft Jurnal_Kelompok 9.docx.md
 Draft Jurnal_Kelompok 9.docx.pdf
+docs/Draft Jurnal Viskom_Kelompok 9.docx
+docs/Draft Jurnal Viskom_Kelompok 9.docx.pdf
 docs/ScanKTM (2).ipynb
+docs/*.docx
+docs/*.pdf
