@@ -9,6 +9,7 @@ Menggunakan OpenCV murni (tanpa library augmentasi tambahan).
 
 Usage (di Colab):
     !python augment_dataset.py --dataset "/content/dataset-name-1" --multiply-train 4 --multiply-val 6 --multiply-test 6
+    !python augment_dataset.py --dataset "/content/dataset-name-1" --target-train 480 --target-val 60 --target-test 60
 """
 
 import argparse
@@ -18,10 +19,15 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 # ────────────────────────────────────────────────────────
@@ -308,21 +314,43 @@ def apply_random_augmentations(
 # ────────────────────────────────────────────────────────
 # Main Augmentor
 # ────────────────────────────────────────────────────────
+def list_image_files(images_dir: str) -> List[str]:
+    """Return supported image files in stable order."""
+    image_files = []
+    for pattern in ("*.jpg", "*.jpeg", "*.png"):
+        image_files.extend(glob.glob(os.path.join(images_dir, pattern)))
+    return sorted(image_files)
+
+
+def build_augmented_paths(
+    images_dir: str,
+    labels_dir: str,
+    basename: str,
+    variant_idx: int,
+) -> Tuple[str, str]:
+    """Return non-existing augmented image and label paths."""
+    while True:
+        aug_name = f"{basename}_aug{variant_idx:03d}"
+        aug_img_path = os.path.join(images_dir, f"{aug_name}.jpg")
+        aug_label_path = os.path.join(labels_dir, f"{aug_name}.txt")
+        if not os.path.exists(aug_img_path) and not os.path.exists(aug_label_path):
+            return aug_img_path, aug_label_path
+        variant_idx += 1
+
+
 def augment_split(
     images_dir: str,
     labels_dir: str,
     multiplier: int,
     split_name: str,
+    target_count: Optional[int] = None,
 ):
     """
     Augment satu split (train/valid/test).
-    Untuk setiap gambar asli, generate `multiplier` variasi baru.
+    Jika target_count diisi, generate variasi sampai total gambar mencapai target.
+    Jika tidak, generate `multiplier` variasi baru untuk setiap gambar asli.
     """
-    image_files = sorted(
-        glob.glob(os.path.join(images_dir, "*.jpg"))
-        + glob.glob(os.path.join(images_dir, "*.jpeg"))
-        + glob.glob(os.path.join(images_dir, "*.png"))
-    )
+    image_files = list_image_files(images_dir)
 
     if not image_files:
         print(f"  ⚠️ No images found in {images_dir}")
@@ -330,10 +358,31 @@ def augment_split(
 
     original_count = len(image_files)
     generated = 0
+    if target_count is not None:
+        target_generated = target_count - original_count
+        if target_generated <= 0:
+            print(f"\nℹ️ [{split_name}] Already has {original_count} images; target is {target_count}. Skipping.")
+            return
 
-    print(f"\n⏳ [{split_name}] Augmenting {original_count} images × {multiplier}x ...", end="", flush=True)
+        work_items = [
+            (image_files[i % original_count], i // original_count)
+            for i in range(target_generated)
+        ]
+        print(
+            f"\n⏳ [{split_name}] Augmenting {original_count} images -> target {target_count} total "
+            f"({target_generated} new) ...",
+            end="",
+            flush=True,
+        )
+    else:
+        work_items = [
+            (img_path, i)
+            for img_path in image_files
+            for i in range(multiplier)
+        ]
+        print(f"\n⏳ [{split_name}] Augmenting {original_count} images × {multiplier}x ...", end="", flush=True)
 
-    for img_path in image_files:
+    for idx, (img_path, variant_idx) in enumerate(work_items, start=1):
         # Load image
         img = cv2.imread(img_path)
         if img is None:
@@ -345,40 +394,40 @@ def augment_split(
         label_path = os.path.join(labels_dir, f"{basename}.txt")
         labels = parse_yolo_labels(label_path)
 
-        # Generate augmented versions
-        for i in range(multiplier):
-            # Vary augmentation intensity
-            num_color = random.randint(2, 4)
-            num_spatial = random.randint(0, 2)
+        # Vary augmentation intensity
+        num_color = random.randint(2, 4)
+        num_spatial = random.randint(0, 2)
 
+        aug_img, aug_labels = apply_random_augmentations(
+            img.copy(),
+            labels.copy(),
+            num_color=num_color,
+            num_spatial=num_spatial,
+        )
+
+        # Skip if all labels were lost during spatial augmentation
+        if labels and not aug_labels:
+            # Retry with color-only
             aug_img, aug_labels = apply_random_augmentations(
-                img.copy(),
-                labels.copy(),
-                num_color=num_color,
-                num_spatial=num_spatial,
+                img.copy(), labels.copy(),
+                num_color=4, num_spatial=0,
             )
 
-            # Skip if all labels were lost during spatial augmentation
-            if labels and not aug_labels:
-                # Retry with color-only
-                aug_img, aug_labels = apply_random_augmentations(
-                    img.copy(), labels.copy(),
-                    num_color=4, num_spatial=0,
-                )
+        # Save augmented image
+        aug_img_path, aug_label_path = build_augmented_paths(
+            images_dir,
+            labels_dir,
+            basename,
+            variant_idx,
+        )
 
-            # Save augmented image
-            aug_name = f"{basename}_aug{i:03d}"
-            aug_img_path = os.path.join(images_dir, f"{aug_name}.jpg")
-            aug_label_path = os.path.join(labels_dir, f"{aug_name}.txt")
+        cv2.imwrite(aug_img_path, aug_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        save_yolo_labels(aug_label_path, aug_labels)
+        generated += 1
 
-            cv2.imwrite(aug_img_path, aug_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            save_yolo_labels(aug_label_path, aug_labels)
-            generated += 1
-
-        # Tampilkan titik setiap 10 gambar selesai diproses
-        idx = image_files.index(img_path) + 1
-        if idx % 10 == 0 or idx == original_count:
-            print(f" {idx}/{original_count}", end="", flush=True)
+        # Tampilkan progress setiap 10 augmentasi selesai dibuat
+        if idx % 10 == 0 or idx == len(work_items):
+            print(f" {idx}/{len(work_items)}", end="", flush=True)
 
     print(f"\n✅ [{split_name}] {original_count} originals + {generated} augmented = {original_count + generated} total")
 
@@ -431,6 +480,18 @@ def main():
         help="Jumlah variasi per gambar di TEST set (default: 6)"
     )
     parser.add_argument(
+        "--target-train", type=int, default=None,
+        help="Target total gambar TRAIN setelah augmentasi (contoh: 480)"
+    )
+    parser.add_argument(
+        "--target-val", type=int, default=None,
+        help="Target total gambar VALID setelah augmentasi (contoh: 60)"
+    )
+    parser.add_argument(
+        "--target-test", type=int, default=None,
+        help="Target total gambar TEST setelah augmentasi (contoh: 60)"
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed untuk reproducibility"
     )
@@ -439,9 +500,21 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    targets = {
+        "train": args.target_train,
+        "valid": args.target_val,
+        "test": args.target_test,
+    }
+
     print("🔧 Smart-Lab Dataset Augmentor")
     print(f"   Dataset: {args.dataset}")
-    print(f"   Multipliers: train={args.multiply_train}x, val={args.multiply_val}x, test={args.multiply_test}x")
+    if any(value is not None for value in targets.values()):
+        print(
+            f"   Targets: train={args.target_train or '-'} imgs, "
+            f"valid={args.target_val or '-'} imgs, test={args.target_test or '-'} imgs"
+        )
+    else:
+        print(f"   Multipliers: train={args.multiply_train}x, val={args.multiply_val}x, test={args.multiply_test}x")
 
     # Detect structure
     splits = find_dataset_structure(args.dataset)
@@ -456,7 +529,7 @@ def main():
     # Count before
     print("\n📊 BEFORE augmentation:")
     for name, dirs in splits.items():
-        count = len(glob.glob(os.path.join(dirs["images"], "*.*")))
+        count = len(list_image_files(dirs["images"]))
         print(f"   {name}: {count} images")
 
     # Augment each split
@@ -468,23 +541,30 @@ def main():
 
     for split_name, dirs in splits.items():
         mult = multipliers.get(split_name, 4)
-        if mult > 0:
+        target = targets.get(split_name)
+        if target is not None or mult > 0:
             augment_split(
                 images_dir=dirs["images"],
                 labels_dir=dirs["labels"],
                 multiplier=mult,
                 split_name=split_name,
+                target_count=target,
             )
 
     # Count after
     print("\n" + "=" * 50)
     print("📊 AFTER augmentation:")
-    total = 0
+    counts = {}
     for name, dirs in splits.items():
-        count = len(glob.glob(os.path.join(dirs["images"], "*.*")))
-        total += count
-        print(f"   {name}: {count} images")
-    print(f"   TOTAL: {total} images")
+        counts[name] = len(list_image_files(dirs["images"]))
+
+    total = sum(counts.values())
+    for name in ["train", "valid", "test"]:
+        if name not in counts:
+            continue
+        pct = (counts[name] / total * 100) if total else 0
+        print(f"   {name:<8} {counts[name]:>5} imgs {pct:>5.1f}%")
+    print(f"   {'TOTAL':<8} {total:>5} imgs")
     print("=" * 50)
     print("\n✅ Augmentation complete! Dataset siap untuk training.")
 

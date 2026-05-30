@@ -67,17 +67,15 @@ CELL_3B = """
 from google.colab import files
 uploaded = files.upload()  # ← pilih file augment_dataset.py
 
-# Jalankan augmentasi:
-# - Train: x4 (50 → 250)
-# - Valid: x6 (2 → 14) 
-# - Test:  x6 (2 → 14)
-# Total: ~278 images (dari 54 asli)
-!python augment_dataset.py --dataset "{dataset.location}" --multiply-train 4 --multiply-val 6 --multiply-test 6
+# Jalankan augmentasi dengan target 80/10/10:
+# - Train: 480 images
+# - Valid: 60 images
+# - Test:  60 images
+# Total: 600 images
+!python augment_dataset.py --dataset "{dataset.location}" --target-train 480 --target-val 60 --target-test 60
 
-# TIPS: Jika di Roboflow Anda sudah ubah split ke 70/15/15,
-# maka valid & test sudah lebih banyak, dan hasil akhirnya:
-# Train: ~26 × 5 = ~130, Valid: ~8 × 7 = ~56, Test: ~8 × 7 = ~56
-# Total: ~242 images yang jauh lebih sehat!
+# Catatan: jika folder dataset sudah pernah diaugmentasi sebelumnya,
+# download ulang dataset Roboflow dulu supaya hitungan target tetap tepat.
 """
 
 # ╔══════════════════════════════════════════════════════════════╗
